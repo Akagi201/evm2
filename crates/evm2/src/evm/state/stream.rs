@@ -193,6 +193,10 @@ impl StateChangeSink for NoopChangeSink {
 }
 
 /// Sink that forwards each change to two sinks.
+///
+/// Each callback reaches `a` before `b`. If `a` returns an error, `b` does not receive that
+/// callback. If `b` returns an error, `a` has already observed it. Previously delivered
+/// callbacks are not rolled back when either sink fails.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Tee<A, B> {
     a: A,

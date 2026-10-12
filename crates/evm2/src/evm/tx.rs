@@ -224,10 +224,8 @@ impl<'evm, 'host, T: EvmTypesHost> ExecutedTx<'evm, 'host, T> {
     /// and then [`commit`](Self::commit) or [`discard`](Self::discard) the transaction.
     #[inline]
     pub fn account_changes(&self) -> impl Iterator<Item = AccountChanges<'_>> {
-        self.has_pending_state()
-            .then(|| self.evm.state.transaction_account_changes())
-            .into_iter()
-            .flatten()
+        debug_assert!(self.has_pending_state());
+        self.evm.state.transaction_account_changes()
     }
 
     /// Accepts the transaction state into the internal accepted overlay.
