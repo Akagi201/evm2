@@ -671,11 +671,7 @@ pub fn prepare_initial_frame<'a, T: EvmTypes>(
                 caller,
                 input: input.clone(),
                 value,
-                code: if host.feature(EvmFeatures::TIP1143) {
-                    CodeSource::Initcode(input.clone())
-                } else {
-                    Bytecode::new_legacy(input.clone()).into()
-                },
+                code: Bytecode::new_legacy(input.clone()).into(),
                 code_hash: B256::ZERO,
                 code_address: destination,
                 disable_precompiles: false,

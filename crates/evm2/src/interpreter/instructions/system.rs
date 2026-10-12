@@ -430,11 +430,7 @@ fn create_inner<T: EvmTypesHost>(
         destination,
         call_target: destination,
         caller,
-        code: if state.feature(EvmFeatures::TIP1143) {
-            CodeSource::Initcode(input.clone())
-        } else {
-            Bytecode::new_legacy(input.clone()).into()
-        },
+        code: Bytecode::new_legacy(input.clone()).into(),
         code_hash: B256::ZERO,
         input,
         value,

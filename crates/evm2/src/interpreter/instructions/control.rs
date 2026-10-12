@@ -30,7 +30,7 @@ pub fn jumpi(cx: _, [target, cond]: [Word]) -> Result {
 #[inline(always)]
 fn jump_inner<T: EvmTypesHost>(target: Word, cx: &mut GasInstructionCx<'_, '_, '_, T>) -> Result {
     let target = word_to_usize_saturated(target);
-    let target = if cx.state.is_chunked_code() {
+    let target = if cx.state.is_account_code() {
         if target >= cx.state.code_size() {
             return Err(InstrStop::InvalidJump);
         }
@@ -170,7 +170,7 @@ fn rjump_inner<T: EvmTypesHost>(
     // Generated padding lives outside logical code positions. Its local RJUMP still
     // requires an analyzed JUMPDEST, and never resolves or loads another chunk.
     let local_pc = cx.state.bytecode().pc_offset(*cx.pc);
-    if cx.state.is_chunked_code()
+    if cx.state.is_account_code()
         && let Some(prepared) = cx.state.active_chunk().prepared()
         && local_pc >= cx.state.active_chunk().payload_len()
         && local_pc < prepared.tail_offset()
@@ -193,7 +193,7 @@ fn rjump_inner<T: EvmTypesHost>(
         .and_then(|post_pc| post_pc.checked_add_signed(offset))
         .filter(|&target| target < cx.state.code_size())
         .ok_or(InstrStop::InvalidJump)?;
-    let prepared = cx.state.is_chunked_code() && cx.state.active_chunk().prepared().is_some();
+    let prepared = cx.state.is_account_code() && cx.state.active_chunk().prepared().is_some();
     let local = if prepared {
         let index = (target / CODE_CHUNK_SIZE) as u32;
         let local = target % CODE_CHUNK_SIZE;

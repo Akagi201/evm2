@@ -311,7 +311,7 @@ fn initcode_extcodecopy_reads_external_account_source() {
     let mut message = MessageExt {
         destination: CALLER,
         code_address: CALLER,
-        code: CodeSource::Initcode(Bytes::from(initcode)),
+        code: Bytecode::new_legacy(Bytes::from(initcode)).into(),
         gas_limit: 100_000,
         ..Default::default()
     };

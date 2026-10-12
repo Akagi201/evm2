@@ -162,10 +162,8 @@ pub fn derive_create_destination(
 /// Code supplied to a frame. Each source carries exactly the data needed to execute it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CodeSource {
-    /// Complete bytecode executed directly as one buffer, without chunk loading.
+    /// Complete bytecode, including initcode, executed directly without chunk loading.
     Direct(Bytecode),
-    /// Immutable transaction input or a snapshot of a CREATE/CREATE2 memory range.
-    Initcode(Bytes),
     /// Entry chunk of account code. Further chunks use the frame's code address and host.
     Account(CodeChunk),
 }
@@ -185,10 +183,30 @@ impl From<Bytecode> for CodeSource {
 impl CodeSource {
     /// Original creation input or stored entry bytes, without ordinary memory safety padding.
     pub fn bytes(&self) -> Bytes {
+        self.as_bytecode().original_bytes()
+    }
+
+    /// Borrows the complete direct bytecode or the active account chunk's buffer.
+    pub const fn as_bytecode(&self) -> &Bytecode {
         match self {
-            Self::Initcode(bytes) => bytes.clone(),
-            Self::Direct(code) => code.original_bytes(),
-            Self::Account(chunk) => chunk.as_bytecode().original_bytes(),
+            Self::Direct(code) => code,
+            Self::Account(chunk) => chunk.as_bytecode(),
+        }
+    }
+
+    /// Complete logical size; direct bytecode already contains the whole input.
+    pub fn code_size(&self) -> usize {
+        match self {
+            Self::Direct(code) => code.len(),
+            Self::Account(chunk) => chunk.code_size(),
+        }
+    }
+
+    /// Index of the active account chunk; direct bytecode starts at zero.
+    pub const fn index(&self) -> u32 {
+        match self {
+            Self::Direct(_) => 0,
+            Self::Account(chunk) => chunk.index(),
         }
     }
 }

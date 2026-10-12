@@ -1,6 +1,6 @@
 use super::{
-    BytecodeRef, CodeSource, Gas, Host, InstrStop, Memory, Message, MessageKind, Pc, Result,
-    StackBacking, StackMut, StackRef, Word, code::InterpreterCode,
+    BytecodeRef, Gas, Host, InstrStop, Memory, Message, MessageKind, Pc, Result, StackBacking,
+    StackMut, StackRef, Word, code::InterpreterCode,
 };
 use crate::{
     EvmTypesHost, ExecutionConfig, ExecutionError, HostError, SpecId, Version,
@@ -185,9 +185,7 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     /// Calculates or returns the cached hash of the original active bytecode.
     #[inline]
     pub fn original_bytecode_hash(&self) -> B256 {
-        if let Some(CodeSource::Initcode(bytes)) = self.message.map(|message| &message.code) {
-            alloy_primitives::keccak256(bytes)
-        } else if self.code.is_account() {
+        if self.code.is_account() {
             self.message.expect("initialized frame").code_hash
         } else {
             self.code.active().as_bytecode().hash_slow()

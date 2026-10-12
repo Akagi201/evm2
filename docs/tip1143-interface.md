@@ -4,7 +4,7 @@ This is an opt-in, unscheduled draft. It does not select an activation date or c
 
 ## Logical code and stored chunks
 
-`Version::with_tip1143(bool)` controls only `EvmFeatures::TIP1143`. Set `Version::max_code_size` and `Version::max_initcode_size` explicitly; toggling the feature preserves those values. `CODE_CHUNK_SIZE` fixes the logical runtime slice size at 24,540 bytes (`24 KiB - 36`), with a format capacity of 40 slices and 981,600 bytes in total. The draft limits are available as `bytecode::MAX_CODE_SIZE` and `bytecode::MAX_INITCODE_SIZE`; initcode's limit is 2,097,152 bytes (2 MiB). Initcode is prepared for execution in chunks on demand. Chunk tariffs are provisionally 28,680 cold and 1,000 warm gas.
+`Version::with_tip1143(bool)` controls only `EvmFeatures::TIP1143`. Set `Version::max_code_size` and `Version::max_initcode_size` explicitly; toggling the feature preserves those values. `CODE_CHUNK_SIZE` fixes the logical runtime slice size at 24,540 bytes (`24 KiB - 36`), with a format capacity of 40 slices and 981,600 bytes in total. The draft limits are available as `bytecode::MAX_CODE_SIZE` and `bytecode::MAX_INITCODE_SIZE`; initcode's limit is 2,097,152 bytes (2 MiB). Initcode is analyzed and executed as one complete bytecode buffer. Chunk tariffs are provisionally 28,680 cold and 1,000 warm gas.
 
 ```rust
 let mut version = Version::base(SpecId::OSAKA).with_tip1143(true);
@@ -70,19 +70,19 @@ Account warmth is keyed by owner and index. Journals restore warmth and code ide
 
 ## Execution and client handoff
 
-`MessageExt::code` is a `CodeSource` with three variants: `Direct(Bytecode)` for complete bytecode executed directly as one buffer, `Account(CodeChunk)` for an account's entry chunk, and `Initcode(Bytes)` for immutable transaction input or a CREATE/CREATE2 memory snapshot. Size is derived from the selected source; initcode carries no unused account entry buffer.
+`MessageExt::code` is a `CodeSource` with two variants: `Direct(Bytecode)` for complete bytecode, including transaction and CREATE/CREATE2 initcode, and `Account(CodeChunk)` for an account's entry buffer. Direct bytecode carries its complete original input and analysis; it needs no chunk size or index.
 
 Code ownership is split into three reusable layers:
 
-- `bytecode::CodeChunk` owns immutable bytecode, analysis and logical context. Account state and interpreter frames share this value.
+- `bytecode::CodeChunk` distinguishes a complete `Legacy(Bytecode)` record from a `Prepared(PreparedCodeChunk)` runtime slice. Only the prepared variant stores full runtime size and chunk index; payload length is derived from those fields. Account state and interpreter frames share these immutable buffers and their analysis.
 - `evm::state::CodeChunkHandle` loads account chunks and journals warmth. The database handles content hashes; account state handles addresses and indices.
-- `interpreter::InterpreterCode` owns the active chunk, execution source, cached borrowed view and PC. It centralizes chunk activation and pointer lifetimes. Logical size, chunk index and tail position come from the active chunk rather than duplicate interpreter fields. Frame-local initcode preparation lives in `bytecode/chunks/initcode.rs`.
+- `interpreter::InterpreterCode` owns the active `CodeSource`, cached borrowed view and PC. It centralizes account chunk activation and pointer lifetimes. Direct code uses its bytecode length; account chunks supply their runtime size, index and tail position.
 
-Recursive calls have independent interpreter cursors. The account owns cached chunks and warmth, never an execution cursor. Returning a frame to the interpreter pool releases its code source and temporary initcode cache.
+Recursive calls have independent interpreter cursors. The account owns cached chunks and warmth, never an execution cursor. Returning a frame to the interpreter pool releases its code source.
 
-Large initcode uses one linear PUSH-boundary scan and caches execution buffers only for chunks entered by execution. Each buffer includes up to 32 original lookahead bytes for crossing immediates and ordinary zero padding at EOF. Initcode dispatch switches buffers between instructions, without executing generated padding or charging a boundary tariff. Account runtime retains its existing generated-tail layout. Jump validity follows the direct interpreter's PUSH-only analysis, including unusual byte sequences inside other immediate encodings.
+Large initcode uses ordinary whole-bytecode PUSH analysis and safety padding. It executes directly with no chunk cache, boundary switching or chunk tariffs. Account runtime retains its generated-tail layout and loads subsequent chunks through the host.
 
-Initcode PC and CODESIZE remain global. CODECOPY reads original input bytes directly and zero-fills out-of-range reads without preparing execution buffers. Account reads, including EXTCODECOPY and calls made by a constructor, still use account loading and tariffs. Input-word gas, CREATE2 hashing of the entire original input, memory expansion, and copy gas are unchanged. The 2 MiB size ceiling does not override transaction gas caps or the transaction data gas floor; these can impose a lower practical input limit. The initcode source and prepared cache are temporary; RETURN output alone is validated, charged for deposit, and installed. REVERT, exceptional halts, failed deposit, and enclosing-frame rollback retain ordinary creation semantics.
+Initcode PC and CODESIZE remain global. CODECOPY reads original input bytes directly and zero-fills out-of-range reads through ordinary bytecode copying. Account reads, including EXTCODECOPY and calls made by a constructor, still use account loading and tariffs. Input-word gas, CREATE2 hashing of the entire original input, memory expansion, and copy gas are unchanged. The 2 MiB size ceiling does not override transaction gas caps or the transaction data gas floor; these can impose a lower practical input limit. The complete initcode is temporary; RETURN output alone is validated, charged for deposit, and installed. REVERT, exceptional halts, failed deposit, and enclosing-frame rollback retain ordinary creation semantics.
 
 Both explicit jump opcodes use unchanged global positions. Untaken JUMPI does not read or warm its target. Cross-chunk jumps and internal fallthrough reserve destination gas before I/O. Copy operations read logical payload bytes directly from prepared buffers. Inline marker copies are synthesized from account metadata. Legacy EXTCODECOPY keeps its 24,576-byte source threshold, independent of the new runtime stride.
 

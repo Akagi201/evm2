@@ -91,7 +91,6 @@ fn dispatch_inner<T: EvmTypesHost, C: EvmConfig<T>, M: InspectMode<T>, G: Dispat
             r = instr(&mut pc, stack.reborrow(), state);
             if r.is_ok() {
                 inc_pc(&mut pc, op);
-                state.advance_initcode_pc(&mut pc);
             }
             gas.sync_after_exec(state, dynamic_gas);
         }

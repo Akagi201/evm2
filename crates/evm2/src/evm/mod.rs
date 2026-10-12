@@ -1197,7 +1197,10 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
             if bytes.len() > self.version().max_initcode_size {
                 return Err(InstrStop::CreateInitCodeSizeLimit.into());
             }
-            message.code = CodeSource::Initcode(bytes);
+            // Creation executes the complete input, never an account chunk.
+            if matches!(message.code, CodeSource::Account(_)) {
+                message.code = Bytecode::new_legacy(bytes).into();
+            }
         }
         let info = if message.value > 0 || message.depth > 0 {
             self.state.account_info_untracked(&message.caller).map_err(HostError::from)?
@@ -4153,7 +4156,7 @@ mod tests {
         }
     }
 
-    fn chunked_initcode_evm() -> Evm<'static, BaseEvmTypes> {
+    fn large_initcode_evm() -> Evm<'static, BaseEvmTypes> {
         let mut version = Version::base(SpecId::OSAKA).with_tip1143(true);
         version.max_code_size = MAX_CODE_SIZE;
         version.max_initcode_size = MAX_INITCODE_SIZE;
@@ -4204,21 +4207,21 @@ mod tests {
     }
 
     #[test]
-    fn chunked_initcode_creation_commits_only_on_success() {
+    fn large_initcode_creation_commits_only_on_success() {
         for (stop, gas_limit, expected) in [
             (op::RETURN, 10_000_000, InstrStop::Return),
             (op::REVERT, 10_000_000, InstrStop::Revert),
             (op::INVALID, 10_000_000, InstrStop::InvalidFEOpcode),
             (op::RETURN, 100_000, InstrStop::OutOfGas),
         ] {
-            let mut evm = chunked_initcode_evm();
+            let mut evm = large_initcode_evm();
             let address = Address::with_last_byte(0x71);
             let initcode = large_initcode(stop, CODE_CHUNK_SIZE + 3);
             let mut message = MessageExt {
                 kind: MessageKind::Create,
                 destination: address,
                 gas_limit,
-                code: CodeSource::Initcode(initcode),
+                code: Bytecode::new_legacy(initcode).into(),
                 ..Default::default()
             };
             let result =
@@ -4246,12 +4249,12 @@ mod tests {
     }
 
     #[test]
-    fn chunked_initcode_factory_create_and_create2_rollback() {
+    fn large_initcode_factory_create_and_create2_rollback() {
         let factory = Address::with_last_byte(0x72);
         let initcode = large_initcode(op::RETURN, 1);
         for is_create2 in [false, true] {
             for revert_parent in [false, true] {
-                let mut evm = chunked_initcode_evm();
+                let mut evm = large_initcode_evm();
                 evm.overlay_db_mut()
                     .insert_account_info(&factory, AccountInfo::default().with_nonce(1));
                 let len = initcode.len();
@@ -4313,12 +4316,12 @@ mod tests {
     }
 
     #[test]
-    fn chunked_initcode_enforces_complete_input_limit() {
-        let mut evm = chunked_initcode_evm();
+    fn large_initcode_enforces_complete_input_limit() {
+        let mut evm = large_initcode_evm();
         let mut message = MessageExt {
             kind: MessageKind::Create,
             gas_limit: 100_000,
-            code: CodeSource::Initcode(vec![op::STOP; MAX_INITCODE_SIZE + 1].into()),
+            code: Bytecode::new_legacy(vec![op::STOP; MAX_INITCODE_SIZE + 1].into()).into(),
             ..Default::default()
         };
         let result = Host::execute_message(&mut evm, &TxEnvExt::default(), &mut message).unwrap();
@@ -4327,8 +4330,8 @@ mod tests {
     }
 
     #[test]
-    fn chunked_initcode_creation_transaction() {
-        let mut evm = chunked_initcode_evm();
+    fn large_initcode_creation_transaction() {
+        let mut evm = large_initcode_evm();
         // A 2 MiB input exceeds Osaka's default transaction cap under the data gas floor.
         // The chunking feature preserves both rules; configure a larger cap for this test.
         let mut version = *evm.version();
