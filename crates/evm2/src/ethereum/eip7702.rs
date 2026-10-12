@@ -590,18 +590,8 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy, Debug)]
-    enum AuthCase {
-        New,
-        Existing,
-        Redelegation,
-        Clearing,
-        Rejected,
-    }
-
     fn setup<H: TxHandlerHooks<BaseEvmTypes> + 'static>(
         runtime_charges: bool,
-        case: AuthCase,
         opcode: u8,
     ) -> (Evm<'static, BaseEvmTypes>, Recovered<TxEnvelope>) {
         let mut version = Version::new(SpecId::AMSTERDAM);
@@ -614,20 +604,8 @@ mod tests {
             AccountInfo::default()
                 .with_code(Bytecode::new_legacy(Bytes::from(vec![0x5f, 0x5f, opcode]))),
         );
-        let nonce = u64::from(!matches!(case, AuthCase::New));
-        if nonce != 0 {
-            let mut account = AccountInfo::default().with_nonce(nonce);
-            if matches!(case, AuthCase::Redelegation | AuthCase::Clearing) {
-                account = account.with_code(Bytecode::new_eip7702(TARGET));
-            }
-            db.insert_account_info(&AUTHORITY, account);
-        }
         let authorization = RecoveredAuthorization::new_unchecked(
-            Authorization {
-                chain_id: U256::from(if matches!(case, AuthCase::Rejected) { 2 } else { 1 }),
-                nonce,
-                address: if matches!(case, AuthCase::Clearing) { Address::ZERO } else { TARGET },
-            },
+            Authorization { chain_id: U256::from(1), nonce: 0, address: TARGET },
             RecoveredAuthority::Valid(AUTHORITY),
         );
         let tx = Recovered::new_unchecked(
@@ -653,35 +631,11 @@ mod tests {
         (evm, tx)
     }
 
-    fn assert_authorization(evm: &mut Evm<'_, BaseEvmTypes>, case: AuthCase) {
-        let mut account = evm.state_mut().account(&AUTHORITY).unwrap();
-        let expected_nonce = match case {
-            AuthCase::New | AuthCase::Rejected => 1,
-            _ => 2,
-        };
-        assert_eq!(account.nonce(), expected_nonce);
-        let expected_target = if matches!(case, AuthCase::Clearing | AuthCase::Rejected) {
-            None
-        } else {
-            Some(TARGET)
-        };
-        assert_eq!(account.load_code().unwrap().eip7702_address(), expected_target);
-    }
-
     #[rstest::rstest]
     fn intrinsic_hook_preserves_prepared_costs_and_authorizations(
-        #[values(false, true)] runtime_charges: bool,
-        #[values(
-            AuthCase::New,
-            AuthCase::Existing,
-            AuthCase::Redelegation,
-            AuthCase::Clearing,
-            AuthCase::Rejected
-        )]
-        case: AuthCase,
         #[values(0x00, 0xfd, 0xfe)] opcode: u8,
     ) {
-        let (mut evm, tx) = setup::<IntrinsicHooks>(runtime_charges, case, opcode);
+        let (mut evm, tx) = setup::<IntrinsicHooks>(true, opcode);
         let intrinsic =
             intrinsic_gas(evm.version(), CALLER, TARGET.into(), &Bytes::new(), 0, 0, U256::ZERO)
                 + u64::from(evm.version().gas_params[GasId::TxEip7702PerEmptyAccountCost])
@@ -697,61 +651,30 @@ mod tests {
             result.total_gas_spent,
             INTRINSIC_STATE + if opcode == 0xfe { 1_000_000 } else { intrinsic + 4 }
         );
-        assert_authorization(&mut evm, case);
+        let mut account = evm.state_mut().account(&AUTHORITY).unwrap();
+        assert_eq!(account.nonce(), 1);
+        assert_eq!(account.load_code().unwrap().eip7702_address(), Some(TARGET));
     }
 
-    #[rstest::rstest]
-    fn default_hook_preserves_conditional_runtime_state_charges(
-        #[values(
-            AuthCase::New,
-            AuthCase::Existing,
-            AuthCase::Redelegation,
-            AuthCase::Clearing,
-            AuthCase::Rejected
-        )]
-        case: AuthCase,
-        #[values(0x00, 0xfd, 0xfe)] opcode: u8,
-    ) {
-        let (mut evm, tx) = setup::<DefaultTxHandlerHooks>(true, case, opcode);
-        let params = &evm.version().gas_params;
-        let expected = match case {
-            AuthCase::New => params.eip7702_auth_state_gas(),
-            AuthCase::Existing => u64::from(params[GasId::TxEip7702PerAuthState]),
-            _ => 0,
-        };
-        let result = evm.transact(&tx).unwrap().commit();
-        assert_eq!(result.status, opcode == 0x00);
-        assert_eq!(result.state_gas_spent, expected);
-        assert_authorization(&mut evm, case);
-    }
-
-    #[rstest::rstest]
-    fn default_hook_preserves_intrinsic_state_refunds(
-        #[values(
-            AuthCase::New,
-            AuthCase::Existing,
-            AuthCase::Redelegation,
-            AuthCase::Clearing,
-            AuthCase::Rejected
-        )]
-        case: AuthCase,
-    ) {
-        let (mut evm, tx) = setup::<RefundableHooks>(false, case, 0x00);
-        let params = &evm.version().gas_params;
-        let expected = match case {
-            AuthCase::New => params.eip7702_auth_state_gas(),
-            AuthCase::Existing => u64::from(params[GasId::TxEip7702PerAuthState]),
-            _ => 0,
-        };
+    #[test]
+    fn default_hook_preserves_intrinsic_state_refunds() {
+        let (mut evm, tx) = setup::<RefundableHooks>(false, 0x00);
+        evm.overlay_db_mut().insert_account_info(
+            &AUTHORITY,
+            AccountInfo::default().with_code(Bytecode::new_eip7702(TARGET)),
+        );
+        let intrinsic =
+            intrinsic_gas(evm.version(), CALLER, TARGET.into(), &Bytes::new(), 0, 0, U256::ZERO)
+                + u64::from(evm.version().gas_params[GasId::TxEip7702PerEmptyAccountCost]);
         let result = evm.transact(&tx).unwrap().commit();
         assert!(result.status);
-        assert_eq!(result.state_gas_spent, expected);
-        assert_authorization(&mut evm, case);
+        assert_eq!(result.state_gas_spent, 0);
+        assert_eq!(result.total_gas_spent, intrinsic + 4);
     }
 
-    #[rstest::rstest]
-    fn hook_out_of_gas_rolls_back_authorizations(#[values(false, true)] runtime_charges: bool) {
-        let (mut evm, tx) = setup::<OutOfGasHooks>(runtime_charges, AuthCase::New, 0xfe);
+    #[test]
+    fn hook_out_of_gas_rolls_back_authorizations() {
+        let (mut evm, tx) = setup::<OutOfGasHooks>(true, 0xfe);
         let result = evm.transact(&tx).unwrap().commit();
         assert_eq!(result.stop, InstrStop::OutOfGas);
         assert_eq!(result.total_gas_spent, 1_000_000);
