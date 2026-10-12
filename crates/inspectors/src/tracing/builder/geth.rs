@@ -683,10 +683,7 @@ mod tests {
             Err(self.error.clone())
         }
 
-        fn get_code_chunk_by_hash(
-            &mut self,
-            chunk_hash: &B256,
-        ) -> DbResult<Option<alloy_primitives::Bytes>> {
+        fn get_code_chunk_by_hash(&mut self, chunk_hash: &B256) -> DbResult<Option<Bytecode>> {
             let _ = chunk_hash;
             Ok(None)
         }

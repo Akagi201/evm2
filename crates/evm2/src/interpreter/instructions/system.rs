@@ -161,11 +161,7 @@ fn load_acc_and_calc_gas<T: EvmTypesHost>(
             // A delegation target is not followed recursively; synthesize its own marker.
             code = Bytecode::new_eip7702(target);
         } else {
-            let tariff = state.chunk_tariff(&code_address, 0);
-            gas.spend(tariff)?;
-            let chunk = state.required_code_chunk(&code_address, 0)?;
-
-            code_chunk = Some(chunk);
+            code_chunk = Some(state.load_and_charge_code_chunk(gas, &code_address, 0)?);
         }
     }
 

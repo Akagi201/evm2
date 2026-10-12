@@ -8,12 +8,12 @@ use crate::{
         WARM_CODE_CHUNK_GAS, code_metadata,
     },
     env::{BlockEnvExt, TxEnvExt},
-    ethereum::ethereum_tx_registry,
+    ethereum::{ethereum_tx_registry, prepare_initial_frame},
     interpreter::{MessageExt, MessageResult, instructions::encode_rjump_offset, op},
     test_utils::{push, push_address, push_all},
 };
 use alloc::{vec, vec::Vec};
-use alloy_primitives::{Bytes, keccak256};
+use alloy_primitives::{Bytes, TxKind, U256, keccak256};
 
 const OWNER: Address = Address::with_last_byte(0x81);
 const CALLER: Address = Address::with_last_byte(0x82);
@@ -35,7 +35,7 @@ impl DynDatabase for CodeReads {
         DynDatabase::get_code_by_hash(&mut self.db, hash)
     }
 
-    fn get_code_chunk_by_hash(&mut self, hash: &B256) -> DbResult<Option<Bytes>> {
+    fn get_code_chunk_by_hash(&mut self, hash: &B256) -> DbResult<Option<Bytecode>> {
         self.reads.push(CodeRead::Chunk(*hash));
         if let Some(error) = &self.chunk_error {
             return Err(error.clone());
@@ -49,10 +49,6 @@ impl DynDatabase for CodeReads {
 
     fn get_block_hash(&mut self, number: &Word) -> DbResult<B256> {
         DynDatabase::get_block_hash(&mut self.db, number)
-    }
-
-    fn discard_code_chunk(&mut self, hash: &B256) {
-        DynDatabase::discard_code_chunk(&mut self.db, hash);
     }
 }
 
@@ -132,7 +128,7 @@ fn extcodecopy_reads_only_intersecting_payloads() {
         assert_eq!(reads(&evm), indices.iter().map(|&i| chunk_read(&bytes, i)).collect::<Vec<_>>());
         assert!(evm.state.account(&OWNER).unwrap().is_warm());
         for i in 0..3 {
-            assert_eq!(Host::code_chunk_is_warm(&evm, &OWNER, i), indices.contains(&i));
+            assert_eq!(evm.state.code_chunk_is_warm(&OWNER, i), indices.contains(&i));
         }
     }
 }
@@ -152,17 +148,17 @@ fn extcodecopy_zero_length_ignores_unrepresentable_offsets() {
 }
 
 #[test]
-fn extcodecopy_reserves_entire_range_before_loading() {
+fn extcodecopy_skips_unaffordable_cold_chunk() {
     let bytes = vec![op::STOP; CODE_CHUNK_SIZE + 1];
     let mut evm = test_evm(&bytes, true);
     let mut code = Vec::new();
     extcopy(&mut code, OWNER, Word::from(CODE_CHUNK_SIZE - 1), 2);
-    // Enough for one cold chunk, but not both. No partial read or warming is allowed.
+    // The first chunk is affordable; skip the second and roll back warmth on halt.
     let result = execute(&mut evm, code, COLD_CODE_CHUNK_GAS + 10_000);
     assert_eq!(result.stop, InstrStop::OutOfGas);
-    assert!(reads(&evm).is_empty());
-    assert!(!Host::code_chunk_is_warm(&evm, &OWNER, 0));
-    assert!(!Host::code_chunk_is_warm(&evm, &OWNER, 1));
+    assert_eq!(reads(&evm), [chunk_read(&bytes, 0)]);
+    assert!(!evm.state.code_chunk_is_warm(&OWNER, 0));
+    assert!(!evm.state.code_chunk_is_warm(&OWNER, 1));
 }
 
 #[test]
@@ -196,7 +192,7 @@ fn legacy_external_code_uses_fixed_limit_after_size_is_known() {
         assert_eq!(result.stop, InstrStop::Return);
         assert_eq!(result.output.as_ref(), [if size == 3 { 0 } else { op::JUMPDEST }, 0]);
         assert_eq!(reads(&evm), [CodeRead::Legacy(keccak256(&bytes))]);
-        assert!(Host::code_chunk_is_warm(&evm, &OWNER, 0));
+        assert!(evm.state.code_chunk_is_warm(&OWNER, 0));
     }
 }
 
@@ -221,8 +217,8 @@ fn repeated_extcodecopy_charges_warm_chunks_and_revert_restores_coldness() {
     let mut reverting = code.clone();
     reverting.extend([op::PUSH0, op::PUSH0, op::REVERT]);
     assert_eq!(execute(&mut evm, reverting, 100_000).stop, InstrStop::Revert);
-    assert!(!Host::code_chunk_is_warm(&evm, &OWNER, 0));
-    assert!(!Host::code_chunk_is_warm(&evm, &OWNER, 1));
+    assert!(!evm.state.code_chunk_is_warm(&OWNER, 0));
+    assert!(!evm.state.code_chunk_is_warm(&OWNER, 1));
     let after_revert = execute(&mut evm, code, 100_000);
     assert_eq!(after_revert.gas.remaining(), cold.gas.remaining());
     // The bytes stay cached, but they must still be charged as cold after rollback.
@@ -326,7 +322,7 @@ fn execute_account(
     evm: &mut Evm<'_, BaseEvmTypes>,
     gas_limit: u64,
 ) -> Result<MessageResult, ExecutionError> {
-    let entry = Host::load_code_chunk(evm, &OWNER, 0).unwrap().unwrap();
+    let entry = Host::load_code_chunk(evm, &OWNER, 0, false).unwrap().unwrap().chunk;
     let mut message = MessageExt {
         destination: OWNER,
         code_address: OWNER,
@@ -401,7 +397,7 @@ fn account_fallthrough_skips_continued_push_data() {
 }
 
 #[test]
-fn account_codecopy_reserves_full_range_before_loading() {
+fn account_codecopy_skips_unaffordable_cold_chunk() {
     let mut bytes = vec![op::STOP; CODE_CHUNK_SIZE * 2 + 1];
     let mut entry = Vec::new();
     push_all(&mut entry, [2, CODE_CHUNK_SIZE * 2 - 1, 0]);
@@ -410,7 +406,7 @@ fn account_codecopy_reserves_full_range_before_loading() {
     let mut evm = test_evm(&bytes, true);
     let result = execute_account(&mut evm, COLD_CODE_CHUNK_GAS + 10_000).unwrap();
     assert_eq!(result.stop, InstrStop::OutOfGas);
-    assert_eq!(reads(&evm), [chunk_read(&bytes, 0)]);
+    assert_eq!(reads(&evm), [chunk_read(&bytes, 0), chunk_read(&bytes, 1)]);
 }
 
 #[test]
@@ -421,7 +417,10 @@ fn extcodecopy_missing_or_malformed_chunk_is_fatal() {
         let chunk_hash = code_metadata(&bytes).unwrap().unwrap().chunk_hashes()[1];
         let db = evm.database_mut().downcast_mut::<CodeReads>().unwrap();
         if malformed {
-            db.db.cache.code_chunks.insert(chunk_hash, vec![op::STOP; 7].into());
+            db.db
+                .cache
+                .code_chunks
+                .insert(chunk_hash, Bytecode::new_legacy(vec![op::STOP; 7].into()));
         } else {
             db.db.cache.code_chunks.remove(&chunk_hash);
         }
@@ -445,14 +444,7 @@ fn extcodecopy_missing_or_malformed_chunk_is_fatal() {
             })
         );
         assert_eq!(reads(&evm), [chunk_read(&bytes, 1)]);
-        // Rejected raw bytes must be evicted from every cache so a repaired provider can retry.
-        let db = evm.database_mut().downcast_mut::<CodeReads>().unwrap();
-        assert!(!db.db.cache.code_chunks.contains_key(&chunk_hash));
-        let chunk = crate::bytecode::code_chunk(&Bytes::copy_from_slice(&bytes), 1).unwrap();
-        db.db.cache.code_chunks.insert(chunk_hash, chunk.as_bytecode().original_bytes());
-        let result = Host::execute_message(&mut evm, &TxEnvExt::default(), &mut message).unwrap();
-        assert_eq!(result.stop, InstrStop::Stop);
-        assert_eq!(reads(&evm), [chunk_read(&bytes, 1), chunk_read(&bytes, 1)]);
+        assert!(evm.state.account(&OWNER).unwrap().code_chunks().is_empty());
     }
 }
 
@@ -521,8 +513,8 @@ fn identical_chunk_hashes_share_bytes_but_not_warmth() {
     let shared = execute(&mut evm, code.clone(), 100_000);
     assert_eq!(shared.stop, InstrStop::Stop);
     assert_eq!(reads(&evm), [chunk_read(&bytes, 0)]);
-    assert!(Host::code_chunk_is_warm(&evm, &OWNER, 0));
-    assert!(Host::code_chunk_is_warm(&evm, &OWNER, 1));
+    assert!(evm.state.code_chunk_is_warm(&OWNER, 0));
+    assert!(evm.state.code_chunk_is_warm(&OWNER, 1));
 
     let other = Address::with_last_byte(0x84);
     let account = evm
@@ -534,14 +526,24 @@ fn identical_chunk_hashes_share_bytes_but_not_warmth() {
         .unwrap()
         .clone();
     evm.overlay_db_mut().insert_account_info(&other, account);
-    assert!(!Host::code_chunk_is_warm(&evm, &other, 0));
+    assert!(!evm.state.code_chunk_is_warm(&other, 0));
     let mut other_copy = Vec::new();
     extcopy(&mut other_copy, other, Word::ZERO, 1);
     let other_result = execute(&mut evm, other_copy, 100_000);
     assert_eq!(other_result.stop, InstrStop::Stop);
     assert_eq!(reads(&evm), [chunk_read(&bytes, 0)]);
-    assert!(Host::code_chunk_is_warm(&evm, &other, 0));
-    assert!(!Host::code_chunk_is_warm(&evm, &other, 1));
+    assert!(evm.state.code_chunk_is_warm(&other, 0));
+    assert!(!evm.state.code_chunk_is_warm(&other, 1));
+    let first = evm.state.load_code_chunk(&OWNER, 0, false).unwrap().unwrap().get().bytecode();
+    for (address, index) in [(OWNER, 1), (other, 0)] {
+        let loaded =
+            evm.state.load_code_chunk(&address, index, false).unwrap().unwrap().get().bytecode();
+        assert!(core::ptr::eq(first.bytes_slice().as_ptr(), loaded.bytes_slice().as_ptr()));
+        assert!(core::ptr::eq(
+            first.legacy_jump_table().unwrap(),
+            loaded.legacy_jump_table().unwrap(),
+        ));
+    }
     let mut cold_copy = Vec::new();
     extcopy(&mut cold_copy, OWNER, Word::ZERO, 1);
     let cold_result = execute(&mut test_evm(&bytes, true), cold_copy, 100_000);
@@ -552,4 +554,102 @@ fn identical_chunk_hashes_share_bytes_but_not_warmth() {
     let distinct = execute(&mut separate, code, 100_000);
     assert_eq!(reads(&separate), [chunk_read(&bytes, 0), chunk_read(&bytes, 1)]);
     assert_eq!(shared.gas.remaining(), distinct.gas.remaining());
+}
+
+#[test]
+fn chunk_skip_cold_preserves_resident_coldness_and_journal() {
+    let bytes = vec![op::STOP; CODE_CHUNK_SIZE + 7];
+    for resident in [false, true] {
+        let mut evm = test_evm(&bytes, true);
+        if resident {
+            evm.state.load_code_chunk(&OWNER, 0, false).unwrap().unwrap();
+        }
+        let checkpoint = evm.state.checkpoint();
+        let journal_len = evm.state.journal().len();
+        assert!(matches!(
+            evm.state.load_code_chunk(&OWNER, 0, true),
+            Err(LoadError::ColdLoadSkipped)
+        ));
+        assert!(matches!(
+            Host::load_code_chunk(&mut evm, &OWNER, 0, true),
+            Err(HostError::Halt(InstrStop::OutOfGas))
+        ));
+        assert_eq!(reads(&evm).len(), usize::from(resident));
+        assert_eq!(evm.state.journal().len(), journal_len);
+        assert!(!evm.state.code_chunk_is_warm(&OWNER, 0));
+        assert_eq!(evm.state.account(&OWNER).unwrap().code_chunks().len(), usize::from(resident));
+
+        let cold = Host::load_code_chunk(&mut evm, &OWNER, 0, false).unwrap().unwrap();
+        assert!(cold.is_cold);
+        let warm = Host::load_code_chunk(&mut evm, &OWNER, 0, true).unwrap().unwrap();
+        assert!(!warm.is_cold);
+        assert_eq!(reads(&evm), [chunk_read(&bytes, 0)]);
+        assert_eq!(evm.state.journal().len(), journal_len + 1);
+        evm.state.rollback(checkpoint, EvmFeatures::TIP1143);
+        assert!(matches!(
+            Host::load_code_chunk(&mut evm, &OWNER, 0, true),
+            Err(HostError::Halt(InstrStop::OutOfGas))
+        ));
+        assert_eq!(evm.state.journal().len(), journal_len);
+        assert_eq!(reads(&evm), [chunk_read(&bytes, 0)]);
+    }
+}
+
+#[test]
+fn chunk_skip_cold_honors_warm_and_cold_gas_boundaries() {
+    let bytes = vec![op::STOP; CODE_CHUNK_SIZE + 7];
+    let mut code = Vec::new();
+    extcopy(&mut code, OWNER, Word::ZERO, 1);
+    for warm in [false, true] {
+        let mut reference = test_evm(&bytes, true);
+        Host::load_account(&mut reference, &OWNER, false, false).unwrap();
+        if warm {
+            Host::load_code_chunk(&mut reference, &OWNER, 0, false).unwrap();
+        }
+        let result = execute(&mut reference, code.clone(), 100_000);
+        assert_eq!(result.stop, InstrStop::Stop);
+        let required = 100_000 - result.gas.remaining();
+        for enough in [false, true] {
+            let mut evm = test_evm(&bytes, true);
+            Host::load_account(&mut evm, &OWNER, false, false).unwrap();
+            if warm {
+                Host::load_code_chunk(&mut evm, &OWNER, 0, false).unwrap();
+            }
+            let result = execute(&mut evm, code.clone(), required - u64::from(!enough));
+            assert_eq!(result.stop, if enough { InstrStop::Stop } else { InstrStop::OutOfGas });
+            assert_eq!(reads(&evm).len(), usize::from(warm || enough));
+            assert_eq!(evm.state.code_chunk_is_warm(&OWNER, 0), warm || enough);
+        }
+    }
+}
+
+#[test]
+fn initial_chunk_skips_cold_read_and_accepts_warm_budget() {
+    let bytes = vec![op::STOP; CODE_CHUNK_SIZE + 7];
+    for warm in [false, true] {
+        for enough in [false, true] {
+            let mut evm = test_evm(&bytes, true);
+            if warm {
+                Host::load_code_chunk(&mut evm, &OWNER, 0, false).unwrap();
+            }
+            let charge = if warm { WARM_CODE_CHUNK_GAS } else { COLD_CODE_CHUNK_GAS };
+            let mut gas = GasTracker::new(charge - u64::from(!enough));
+            let frame = prepare_initial_frame(
+                &mut evm,
+                CALLER,
+                0,
+                TxKind::Call(OWNER),
+                &Bytes::new(),
+                U256::ZERO,
+                &mut gas,
+            )
+            .unwrap();
+            assert_eq!(frame.is_some(), enough);
+            assert_eq!(reads(&evm).len(), usize::from(warm || enough));
+            assert_eq!(evm.state.code_chunk_is_warm(&OWNER, 0), warm || enough);
+            if enough {
+                assert_eq!(gas.remaining(), 0);
+            }
+        }
+    }
 }

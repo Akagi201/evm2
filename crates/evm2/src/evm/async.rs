@@ -10,7 +10,7 @@ use crate::{
     evm::{AccountInfo, DbResult, DynDatabase, NonStaticAny},
     interpreter::Word,
 };
-use alloy_primitives::{Address, B256, Bytes};
+use alloy_primitives::{Address, B256};
 use core::{fmt, future::Future, marker::PhantomData, pin::Pin, ptr::NonNull, task::Poll};
 use corosensei::{Coroutine, CoroutineResult, Yielder, stack::DefaultStack};
 use std::{cell::Cell, error::Error, io, task::Context};
@@ -427,12 +427,7 @@ pub trait AsyncDatabase: NonStaticAny {
     fn get_code_chunk_by_hash(
         &mut self,
         chunk_hash: B256,
-    ) -> impl Future<Output = Result<Option<Bytes>, Self::Error>> + Send + '_;
-
-    /// Invalidates a rejected raw response in any provider-local cache.
-    fn discard_code_chunk(&mut self, chunk_hash: B256) {
-        let _ = chunk_hash;
-    }
+    ) -> impl Future<Output = Result<Option<Bytecode>, Self::Error>> + Send + '_;
 
     /// Loads a persistent storage slot.
     fn get_storage(
@@ -491,11 +486,7 @@ impl<D: AsyncDatabase> AsyncDb<D> {
 }
 
 impl<D: AsyncDatabase> DynDatabase for AsyncDb<D> {
-    fn discard_code_chunk(&mut self, chunk_hash: &B256) {
-        self.db.discard_code_chunk(*chunk_hash);
-    }
-
-    fn get_code_chunk_by_hash(&mut self, chunk_hash: &B256) -> DbResult<Option<Bytes>> {
+    fn get_code_chunk_by_hash(&mut self, chunk_hash: &B256) -> DbResult<Option<Bytecode>> {
         let result = block_on_current_result(self.db.get_code_chunk_by_hash(*chunk_hash));
         self.database_result(result)
     }
@@ -1065,7 +1056,7 @@ mod tests {
         fn get_code_chunk_by_hash(
             &mut self,
             chunk_hash: &B256,
-        ) -> Result<Option<Bytes>, Self::Error> {
+        ) -> Result<Option<Bytecode>, Self::Error> {
             let _ = chunk_hash;
             Ok(None)
         }
@@ -1105,7 +1096,7 @@ mod tests {
         fn get_code_chunk_by_hash(
             &mut self,
             chunk_hash: &B256,
-        ) -> Result<Option<Bytes>, Self::Error> {
+        ) -> Result<Option<Bytecode>, Self::Error> {
             let _ = chunk_hash;
             Ok(None)
         }
@@ -1213,7 +1204,7 @@ mod tests {
         async fn get_code_chunk_by_hash(
             &mut self,
             chunk_hash: B256,
-        ) -> Result<Option<Bytes>, Self::Error> {
+        ) -> Result<Option<Bytecode>, Self::Error> {
             let _ = chunk_hash;
             Ok(None)
         }
@@ -1252,7 +1243,7 @@ mod tests {
         async fn get_code_chunk_by_hash(
             &mut self,
             chunk_hash: B256,
-        ) -> Result<Option<Bytes>, Self::Error> {
+        ) -> Result<Option<Bytecode>, Self::Error> {
             let _ = chunk_hash;
             Ok(None)
         }
@@ -1296,7 +1287,7 @@ mod tests {
         async fn get_code_chunk_by_hash(
             &mut self,
             chunk_hash: B256,
-        ) -> Result<Option<Bytes>, Self::Error> {
+        ) -> Result<Option<Bytecode>, Self::Error> {
             let _ = chunk_hash;
             Ok(None)
         }
@@ -1351,7 +1342,7 @@ mod tests {
         async fn get_code_chunk_by_hash(
             &mut self,
             chunk_hash: B256,
-        ) -> Result<Option<Bytes>, Self::Error> {
+        ) -> Result<Option<Bytecode>, Self::Error> {
             let _ = chunk_hash;
             Ok(None)
         }

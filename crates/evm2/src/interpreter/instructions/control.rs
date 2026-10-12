@@ -40,7 +40,11 @@ fn jump_inner<T: EvmTypesHost>(target: Word, cx: &mut GasInstructionCx<'_, '_, '
         if multi {
             let local = target % CODE_CHUNK_SIZE;
             let chunk = if index != cx.state.code_chunk_index() {
-                cx.state.execution_code_chunk(cx.gas, index)?
+                cx.state.load_and_charge_code_chunk(
+                    cx.gas,
+                    &cx.state.message().code_address,
+                    index,
+                )?
             } else {
                 cx.state.active_chunk().clone()
             };
@@ -200,7 +204,7 @@ fn rjump_inner<T: EvmTypesHost>(
         let chunk = if index == cx.state.code_chunk_index() {
             cx.state.active_chunk().clone()
         } else {
-            cx.state.execution_code_chunk(cx.gas, index)?
+            cx.state.load_and_charge_code_chunk(cx.gas, &cx.state.message().code_address, index)?
         };
         let local = if transfer {
             // Only the authenticated generated tail may enter a non-JUMPDEST.

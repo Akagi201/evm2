@@ -4,7 +4,6 @@ mod account;
 mod block;
 mod code_chunks;
 pub use code_chunks::{AccountCodeChunk, CodeChunkHandle};
-mod extension;
 mod journal;
 mod pending;
 mod storage;
@@ -15,7 +14,6 @@ mod tracked;
 pub(crate) use account::Account;
 pub use account::{AccountHandle, AccountInfo};
 pub use block::BlockStateAccumulator;
-pub use extension::AccountExtension;
 pub use journal::{JournalEntry, StateCheckpoint};
 pub use pending::PendingState;
 pub use storage::{StorageHandle, StorageOverlay, StorageSlot, StorageSlotHandle};
@@ -23,6 +21,11 @@ pub use stream::{
     AccountChangeRef, NoopChangeSink, StateChangeSink, StateChangeSource, StorageChange, Tee,
 };
 pub use tracked::Tracked;
+
+#[cfg(feature = "account-ext")]
+mod extension;
+#[cfg(feature = "account-ext")]
+pub use extension::AccountExtension;
 
 use super::{
     PrewarmSet,
@@ -646,6 +649,7 @@ impl<'a> State<'a> {
             code_hash: KECCAK256_EMPTY,
             code: Some(Bytecode::default()),
             _non_exhaustive: (),
+            #[cfg(feature = "account-ext")]
             extension: AccountExtension::new(),
         });
         target.mark_created();

@@ -105,7 +105,7 @@ impl DatabaseError {
     }
 }
 
-/// A state load can be skipped before reading a cold account or slot.
+/// A state load can be skipped before reading a cold account, slot, or code chunk.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LoadError {
     /// The requested cold load was skipped without reading the database.

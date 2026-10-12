@@ -14,7 +14,7 @@ use crate::{
     interpreter::Word,
 };
 use alloy_primitives::{
-    Address, B256, Bytes, KECCAK256_EMPTY,
+    Address, B256, KECCAK256_EMPTY,
     map::{AddressMap, B256Map, U256Map, hash_map::Entry},
 };
 use core::convert::Infallible;
@@ -55,7 +55,7 @@ pub struct Cache {
     /// Contracts keyed by code hash.
     pub contracts: B256Map<Bytecode>,
     /// Stored prepared buffers keyed by chunk hash. Execution validates their logical context.
-    pub code_chunks: B256Map<Bytes>,
+    pub code_chunks: B256Map<Bytecode>,
     /// Persistent storage keyed by account, then slot.
     pub storage: AddressMap<AccountStorageCache>,
     /// Cached block hashes keyed by block number.
@@ -91,16 +91,13 @@ impl Cache {
         self.contracts.insert(code_hash, code.clone());
     }
 
-    fn insert_chunks(chunks: &mut B256Map<Bytes>, code: &Bytecode) {
+    fn insert_chunks(chunks: &mut B256Map<Bytecode>, code: &Bytecode) {
         if code.len() > CODE_CHUNK_SIZE {
             let bytes = code.original_bytes();
             for (index, _) in bytes.chunks(CODE_CHUNK_SIZE).enumerate() {
                 let index = u32::try_from(index).expect("bytecode index fits u32");
                 if let Some(chunk) = crate::bytecode::code_chunk(&bytes, index) {
-                    chunks.insert(
-                        chunk.as_bytecode().hash_slow(),
-                        chunk.as_bytecode().original_bytes(),
-                    );
+                    chunks.insert(chunk.as_bytecode().hash_slow(), chunk.bytecode());
                 }
             }
         }
@@ -222,7 +219,7 @@ impl<ExtDB> CacheDB<ExtDB> {
     #[inline]
     fn insert_contract_inner(
         contracts: &mut B256Map<Bytecode>,
-        chunks: &mut B256Map<Bytes>,
+        chunks: &mut B256Map<Bytecode>,
         info: &mut AccountInfo,
     ) {
         if let Some(code) = &info.code
@@ -337,12 +334,7 @@ impl<ExtDB> StateChangeSink for CacheDB<ExtDB> {
 }
 
 impl<ExtDB: DynDatabase> DynDatabase for CacheDB<ExtDB> {
-    fn discard_code_chunk(&mut self, chunk_hash: &B256) {
-        self.cache.code_chunks.remove(chunk_hash);
-        self.db.discard_code_chunk(chunk_hash);
-    }
-
-    fn get_code_chunk_by_hash(&mut self, chunk_hash: &B256) -> DbResult<Option<Bytes>> {
+    fn get_code_chunk_by_hash(&mut self, chunk_hash: &B256) -> DbResult<Option<Bytecode>> {
         if *chunk_hash == KECCAK256_EMPTY || chunk_hash.is_zero() {
             return Ok(None);
         }
@@ -453,14 +445,10 @@ mod typed {
     use crate::evm::Database;
 
     impl<ExtDB: DynDatabase> Database for CacheDB<ExtDB> {
-        fn discard_code_chunk(&mut self, chunk_hash: &B256) {
-            DynDatabase::discard_code_chunk(self, chunk_hash);
-        }
-
         fn get_code_chunk_by_hash(
             &mut self,
             chunk_hash: &B256,
-        ) -> Result<Option<Bytes>, Self::Error> {
+        ) -> Result<Option<Bytecode>, Self::Error> {
             DynDatabase::get_code_chunk_by_hash(self, chunk_hash)
         }
 
@@ -592,7 +580,7 @@ mod tests {
         fn get_code_chunk_by_hash(
             &mut self,
             chunk_hash: &B256,
-        ) -> Result<Option<Bytes>, Self::Error> {
+        ) -> Result<Option<Bytecode>, Self::Error> {
             let _ = chunk_hash;
             Ok(None)
         }

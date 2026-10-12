@@ -7,6 +7,7 @@ use super::{BytecodeRef, CodeSource, Gas, Host, InterpreterState, Pc, Result, Wo
 use crate::{
     EvmTypesHost,
     bytecode::{CODE_CHUNK_SIZE, COLD_CODE_CHUNK_GAS, CodeChunk, WARM_CODE_CHUNK_GAS},
+    evm::CodeChunkLoad,
     trustme,
     utils::word_to_usize_saturated,
 };
@@ -139,29 +140,22 @@ impl<T: EvmTypesHost> InterpreterState<'_, '_, T> {
         }
     }
 
-    /// Tariff based only on logical warmth, before any payload fetch.
-    pub(crate) fn chunk_tariff(&mut self, address: &Address, index: u32) -> u64 {
-        if self.host().code_chunk_is_warm(address, index) {
-            WARM_CODE_CHUNK_GAS
-        } else {
-            COLD_CODE_CHUNK_GAS
-        }
-    }
-
-    /// Loads a required payload after the caller has reserved gas.
-    pub(crate) fn required_code_chunk(
+    /// Loads an account execution buffer and its prior coldness in one host access.
+    pub(crate) fn execution_code_chunk(
         &mut self,
         address: &Address,
         index: u32,
-    ) -> Result<CodeChunk> {
-        self.host().load_code_chunk(address, index).map_err(|error| self.fail(error))?.ok_or_else(
-            || {
+        skip_cold: bool,
+    ) -> Result<CodeChunkLoad> {
+        self.host()
+            .load_code_chunk(address, index, skip_cold)
+            .map_err(|error| self.fail(error))?
+            .ok_or_else(|| {
                 self.fail(crate::DatabaseError::new(
                     MissingRuntimeChunk { address: *address, index },
                     true,
                 ))
-            },
-        )
+            })
     }
 
     /// Replaces the owner before rebuilding its borrowed view. Callers reset their PC next.
@@ -169,14 +163,24 @@ impl<T: EvmTypesHost> InterpreterState<'_, '_, T> {
         self.0.code.activate(chunk);
     }
 
-    /// Loads an execution chunk from the account host after reserving gas.
-    pub(crate) fn execution_code_chunk(&mut self, gas: &mut Gas, index: u32) -> Result<CodeChunk> {
-        let address = self.message().code_address;
-        gas.spend(self.chunk_tariff(&address, index))?;
-        self.required_code_chunk(&address, index)
+    /// Pays the warm charge first, skipping a cold load if its premium is unaffordable.
+    pub(crate) fn load_and_charge_code_chunk(
+        &mut self,
+        gas: &mut Gas,
+        address: &Address,
+        index: u32,
+    ) -> Result<CodeChunk> {
+        gas.spend(WARM_CODE_CHUNK_GAS)?;
+        let cold_additional = COLD_CODE_CHUNK_GAS - WARM_CODE_CHUNK_GAS;
+        let loaded =
+            self.execution_code_chunk(address, index, gas.remaining() < cold_additional)?;
+        if loaded.is_cold {
+            gas.spend(cold_additional)?;
+        }
+        Ok(loaded.chunk)
     }
 
-    /// Reserves the complete known range tariff before its first payload read.
+    /// Loads and charges each chunk once, stopping before any unaffordable cold read.
     pub(crate) fn load_code_range(
         &mut self,
         gas: &mut Gas,
@@ -199,14 +203,9 @@ impl<T: EvmTypesHost> InterpreterState<'_, '_, T> {
         } else {
             (0, 0)
         };
-        let mut cost = 0;
-        for index in first..=last {
-            cost += self.chunk_tariff(&code_owner, index);
-        }
-        gas.spend(cost)?;
         let mut bytes = Vec::new();
         for index in first..=last {
-            let chunk = self.required_code_chunk(&code_owner, index)?;
+            let chunk = self.load_and_charge_code_chunk(gas, &code_owner, index)?;
             let base = if multi { index as usize * CODE_CHUNK_SIZE } else { 0 };
             let from = source.saturating_sub(base).min(chunk.payload_len());
             let to = end.saturating_sub(base).min(chunk.payload_len());
@@ -226,5 +225,5 @@ struct MissingRuntimeChunk {
     index: u32,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "account-ext"))]
 mod tests;

@@ -39,6 +39,9 @@ serde = { workspace = true, features = ["derive", "alloc"], optional = true }
 # "async"
 corosensei = { workspace = true, optional = true }
 
+# account-ext
+triomphe = { workspace = true, optional = true }
+
 # nightly
 ruint = { workspace = true, optional = true }
 
@@ -132,6 +135,7 @@ std = [
     "p256/std",
     "phf?/std",
     "thiserror/std",
+    "triomphe?/std",
     "c-kzg?/std",
     "secp256k1?/std",
     "serde?/std",
@@ -139,6 +143,9 @@ std = [
 ]
 
 async = ["std", "dep:corosensei"]
+
+# Opt-in account payloads, including TIP-1143 metadata.
+account-ext = ["dep:triomphe"]
 
 serde = [
     "dep:serde",

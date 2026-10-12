@@ -1002,15 +1002,12 @@ fn prepare_initial_chunked_frame<T: EvmTypes>(
         if let Some(target) = account.inline_delegation {
             code = Bytecode::new_eip7702(target);
         } else {
-            let tariff = if host.state.code_chunk_is_warm(&owner, 0) {
-                WARM_CODE_CHUNK_GAS
-            } else {
-                COLD_CODE_CHUNK_GAS
-            };
-            if tx_gas.spend(tariff).is_err() {
+            if tx_gas.spend(WARM_CODE_CHUNK_GAS).is_err() {
                 return Ok(None);
             }
-            let loaded = match Host::load_code_chunk(host, &owner, 0) {
+            let cold_additional = COLD_CODE_CHUNK_GAS - WARM_CODE_CHUNK_GAS;
+            let skip_cold = tx_gas.remaining() < cold_additional;
+            let loaded = match Host::load_code_chunk(host, &owner, 0, skip_cold) {
                 Ok(Some(loaded)) => loaded,
                 Ok(None) => {
                     return Err(crate::DatabaseError::new(
@@ -1023,7 +1020,10 @@ fn prepare_initial_chunked_frame<T: EvmTypes>(
                 Err(HostError::Execution(error)) => return Err(error.into()),
             };
 
-            code_chunk = Some(loaded);
+            if loaded.is_cold && tx_gas.spend(cold_additional).is_err() {
+                return Ok(None);
+            }
+            code_chunk = Some(loaded.chunk);
         }
     }
     Ok(Some(InitialFrame {

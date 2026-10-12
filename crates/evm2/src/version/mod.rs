@@ -95,6 +95,7 @@ impl Version {
 
     /// Enables or disables the unscheduled TIP-1143 draft.
     /// Configure [`Self::max_code_size`] and [`Self::max_initcode_size`] independently.
+    #[cfg(feature = "account-ext")]
     pub const fn with_tip1143(mut self, enabled: bool) -> Self {
         self.features.set(EvmFeatures::TIP1143, enabled);
         self

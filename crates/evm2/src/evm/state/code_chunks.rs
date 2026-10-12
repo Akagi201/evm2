@@ -2,7 +2,7 @@
 
 use super::{Account, AccountInfo, JournalEntry, State, StateInner};
 use crate::{
-    CodeChunkLoadError, DatabaseError,
+    CodeChunkLoadError, DatabaseError, LoadError,
     bytecode::{CodeChunk, LEGACY_CODE_CHUNK_SIZE, code_chunk},
     evm::db::{DbResult, DynDatabase},
 };
@@ -34,7 +34,8 @@ impl<'a, 'db> CodeChunkHandle<'a, 'db> {
         index: u32,
         account: &'a mut Account,
         inner: &'a mut StateInner<'db>,
-    ) -> DbResult<Option<Self>> {
+        skip_cold: bool,
+    ) -> Result<Option<Self>, LoadError> {
         let Some(info) = &account.present else { return Ok(None) };
         if info.code_hash.is_zero() || info.code_hash == KECCAK256_EMPTY {
             return Ok(None);
@@ -49,8 +50,17 @@ impl<'a, 'db> CodeChunkHandle<'a, 'db> {
             None
         };
         let chunk = match account.code_chunks.entry(index) {
-            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Occupied(entry) => {
+                let chunk = entry.into_mut();
+                if skip_cold && !chunk.is_warm {
+                    return Err(LoadError::ColdLoadSkipped);
+                }
+                chunk
+            }
             Entry::Vacant(entry) => {
+                if skip_cold {
+                    return Err(LoadError::ColdLoadSkipped);
+                }
                 let chunk = load_chunk(inner, info, index, expected)?;
                 if expected.is_none() {
                     account.code_size = Some(chunk.payload_len() as u32);
@@ -107,16 +117,24 @@ impl<'db> State<'db> {
     ///
     /// Like storage loading, successful reads remain cached across rollback. Call
     /// [`CodeChunkHandle::warm`] to record a reversible access. Callers must reserve gas
-    /// before loading, independently of whether the payload is already cached.
-    /// Empty code and out-of-range indices return `None` without fetching a payload.
+    /// before loading. With `skip_cold`, cold chunks return [`LoadError::ColdLoadSkipped`]
+    /// without fetching, caching, warming, or journaling, even if their bytes are resident.
+    /// For a loaded account, empty code and out-of-range indices return `None`.
+    /// An unseen account is skipped without loading its metadata when `skip_cold` is true.
     pub fn load_code_chunk(
         &mut self,
         address: &Address,
         index: u32,
-    ) -> DbResult<Option<CodeChunkHandle<'_, 'db>>> {
+        skip_cold: bool,
+    ) -> Result<Option<CodeChunkHandle<'_, 'db>>, LoadError> {
         let Self { accounts, inner, .. } = self;
-        let account = Self::account_raw(inner, accounts, address)?;
-        CodeChunkHandle::load(*address, index, account, inner)
+        let account = if skip_cold {
+            // An unseen account cannot have a warm chunk. Avoid its metadata read too.
+            accounts.get_mut(address).ok_or(LoadError::ColdLoadSkipped)?
+        } else {
+            Self::account_raw(inner, accounts, address)?
+        };
+        CodeChunkHandle::load(*address, index, account, inner, skip_cold)
     }
 }
 
@@ -130,7 +148,8 @@ fn load_chunk(
     let hash = info.code_hash;
     let metadata = info.code_metadata();
     let multi = metadata.is_some();
-    let payload_hash = metadata.map_or(hash, |m| m.chunk_hashes()[index as usize]);
+    let payload_hash =
+        metadata.map_or(hash, |m| m.chunk_hash(index).expect("validated chunk index"));
     let result = if let Some(code) = &info.code {
         Ok(if multi {
             code_chunk(&code.original_bytes(), index)
@@ -138,10 +157,10 @@ fn load_chunk(
             Some(CodeChunk::from_bytecode(code))
         })
     } else if let Some(metadata) = metadata {
-        inner.database.get_code_chunk_by_hash(&payload_hash).and_then(|bytes| {
-            bytes
-                .map(|bytes| {
-                    CodeChunk::from_prepared(bytes, metadata.code_size(), index).map_err(|_| {
+        inner.database.get_code_chunk_by_hash(&payload_hash).and_then(|bytecode| {
+            bytecode
+                .map(|bytecode| {
+                    CodeChunk::from_prepared(bytecode, metadata.code_size(), index).map_err(|_| {
                         DatabaseError::new(CodeChunkLoadError::Invalid(payload_hash), true)
                     })
                 })
@@ -167,7 +186,6 @@ fn load_chunk(
             chunk
         }
         result => {
-            inner.database.discard_code_chunk(&payload_hash);
             return Err(match result {
                 Ok(Some(_)) => DatabaseError::new(CodeChunkLoadError::Invalid(payload_hash), true),
                 Ok(None) => DatabaseError::new(CodeChunkLoadError::Missing(payload_hash), true),
@@ -175,6 +193,5 @@ fn load_chunk(
             });
         }
     };
-    let _ = chunk.bytecode().legacy_jump_table();
     Ok(chunk)
 }

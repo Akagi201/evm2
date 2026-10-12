@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     CodeChunkLoadError, DatabaseError, EvmFeatures,
-    bytecode::{Bytecode, CodeMetadata},
+    bytecode::{Bytecode, CodeMetadata, CodeMetadataRef},
     interpreter::Word,
 };
 use alloy_primitives::{Address, B256, KECCAK256_EMPTY, U256, map::HashMap};
@@ -33,6 +33,7 @@ pub struct AccountInfo {
     pub code: Option<Bytecode>,
     /// Authoritative code representation: empty, version 1 chunks, or version 2 delegation.
     #[cfg_attr(feature = "serde", serde(default))]
+    #[cfg(feature = "account-ext")]
     pub extension: super::AccountExtension,
     #[doc(hidden)] // Not public API. Please use an existing constructor.
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -45,10 +46,12 @@ pub struct AccountInfo {
 impl PartialEq for AccountInfo {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        self.balance == other.balance
+        let equal = self.balance == other.balance
             && self.nonce == other.nonce
-            && self.code_hash == other.code_hash
-            && self.extension == other.extension
+            && self.code_hash == other.code_hash;
+        #[cfg(feature = "account-ext")]
+        let equal = equal && self.extension == other.extension;
+        equal
     }
 }
 
@@ -73,6 +76,7 @@ impl Default for AccountInfo {
             nonce: 0,
             code_hash: KECCAK256_EMPTY,
             code: Some(Bytecode::default()),
+            #[cfg(feature = "account-ext")]
             extension: super::AccountExtension::new(),
             _non_exhaustive: (),
         }
@@ -97,6 +101,7 @@ impl AccountInfo {
             balance,
             nonce,
             code_hash,
+            #[cfg(feature = "account-ext")]
             extension: code.as_ref().map(super::AccountExtension::for_code).unwrap_or_default(),
             code,
             _non_exhaustive: (),
@@ -112,6 +117,7 @@ impl AccountInfo {
             nonce: self.nonce,
             code_hash: self.code_hash,
             code: None,
+            #[cfg(feature = "account-ext")]
             extension: self.extension.clone(),
             _non_exhaustive: (),
         }
@@ -142,7 +148,10 @@ impl AccountInfo {
     #[inline]
     pub fn set_code(&mut self, code: Bytecode) {
         self.code_hash = code.hash_slow();
-        self.extension = super::AccountExtension::for_code(&code);
+        #[cfg(feature = "account-ext")]
+        {
+            self.extension = super::AccountExtension::for_code(&code);
+        }
         self.code = Some(code);
     }
 
@@ -150,7 +159,9 @@ impl AccountInfo {
     #[inline]
     pub fn is_empty(&self) -> bool {
         let empty = self.balance.is_zero() && self.nonce == 0 && self.code_hash == KECCAK256_EMPTY;
-        empty && self.extension.is_empty()
+        #[cfg(feature = "account-ext")]
+        let empty = empty && self.extension.is_empty();
+        empty
     }
 }
 
@@ -651,7 +662,10 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
         self.touch();
         let account = self.present_mut();
         account.code_hash = code_hash;
-        account.extension = super::AccountExtension::for_code(&code);
+        #[cfg(feature = "account-ext")]
+        {
+            account.extension = super::AccountExtension::for_code(&code);
+        }
         account.code = Some(code);
         self.tracked.code_changed = true;
         self.tracked.code_size = None;
@@ -673,12 +687,18 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
         code: Bytecode,
         metadata: Option<CodeMetadata>,
     ) {
+        #[cfg(not(feature = "account-ext"))]
+        assert!(metadata.is_none(), "chunk metadata requires the account-ext feature");
         self.set_code_slow(code);
-        self.present_mut().extension =
-            metadata.map(super::AccountExtension::chunked).unwrap_or_default();
+        #[cfg(feature = "account-ext")]
+        {
+            self.present_mut().extension =
+                metadata.map(super::AccountExtension::chunked).unwrap_or_default();
+        }
     }
 
     /// Validates and installs code explicitly using the draft chunked runtime representation.
+    #[cfg(feature = "account-ext")]
     pub fn set_chunked_code(
         &mut self,
         code: Bytecode,
@@ -724,7 +744,10 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
     pub fn set_info(&mut self, info: AccountInfo) {
         self.record_change();
         if self.tracked.present.as_ref().is_none_or(|previous| {
-            previous.code_hash != info.code_hash || previous.extension != info.extension
+            let changed = previous.code_hash != info.code_hash;
+            #[cfg(feature = "account-ext")]
+            let changed = changed || previous.extension != info.extension;
+            changed
         }) {
             self.tracked.code_size = None;
             self.tracked.code_chunks.clear();
@@ -734,6 +757,7 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
     }
 
     /// Updates the account payload, touching the account and recording a revert snapshot.
+    #[cfg(feature = "account-ext")]
     pub fn set_extension(&mut self, extension: super::AccountExtension) {
         self.touch();
         if self.present_mut().extension != extension {
@@ -798,12 +822,15 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
 #[cfg(feature = "serde")]
 impl serde::Serialize for AccountInfo {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut record = serializer
-            .serialize_struct("AccountInfo", 4 + usize::from(!self.extension.is_empty()))?;
+        let fields = 4;
+        #[cfg(feature = "account-ext")]
+        let fields = fields + usize::from(!self.extension.is_empty());
+        let mut record = serializer.serialize_struct("AccountInfo", fields)?;
         record.serialize_field("balance", &self.balance)?;
         record.serialize_field("nonce", &self.nonce)?;
         record.serialize_field("code_hash", &self.code_hash)?;
         record.serialize_field("code", &self.code)?;
+        #[cfg(feature = "account-ext")]
         if !self.extension.is_empty() {
             record.serialize_field("extension", &self.extension)?;
         }
@@ -813,13 +840,27 @@ impl serde::Serialize for AccountInfo {
 
 impl AccountInfo {
     /// Version 1 chunk commitments, if this account uses chunked code.
-    pub fn code_metadata(&self) -> Option<&CodeMetadata> {
-        self.extension.code_metadata()
+    pub fn code_metadata(&self) -> Option<CodeMetadataRef<'_>> {
+        #[cfg(feature = "account-ext")]
+        {
+            self.extension.code_metadata()
+        }
+        #[cfg(not(feature = "account-ext"))]
+        {
+            None
+        }
     }
 
     /// Version 2 delegation target, available without fetching code.
     pub fn delegation_target(&self) -> Option<Address> {
-        self.extension.delegation_target()
+        #[cfg(feature = "account-ext")]
+        {
+            self.extension.delegation_target()
+        }
+        #[cfg(not(feature = "account-ext"))]
+        {
+            None
+        }
     }
 
     /// Validates and synthesizes an inline marker without reading a bytecode payload.

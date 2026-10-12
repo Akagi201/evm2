@@ -149,9 +149,7 @@ pub fn extcodesize(cx: _, [addr]: [Word]) -> Result<out> {
         account.code_size.expect("chunked size") as usize
     } else {
         let code_owner = word_to_address(*addr);
-        let tariff = cx.state.chunk_tariff(&code_owner, 0);
-        cx.gas.spend(tariff)?;
-        cx.state.required_code_chunk(&code_owner, 0)?.payload_len()
+        cx.state.load_and_charge_code_chunk(cx.gas, &code_owner, 0)?.payload_len()
     };
     *out = Word::from(size);
 }

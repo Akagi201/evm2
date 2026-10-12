@@ -139,12 +139,13 @@ impl Host<TestTypes> for TestHost {
         &mut self,
         _: &Address,
         index: u32,
-    ) -> Result<Option<crate::bytecode::CodeChunk>, crate::HostError> {
-        Ok(code_chunk(&self.code, index))
-    }
-
-    fn code_chunk_is_warm(&self, _: &Address, _: u32) -> bool {
-        !self.is_cold
+        skip_cold: bool,
+    ) -> Result<Option<crate::evm::CodeChunkLoad>, crate::HostError> {
+        if skip_cold && self.is_cold {
+            return Err(InstrStop::OutOfGas.into());
+        }
+        Ok(code_chunk(&self.code, index)
+            .map(|chunk| crate::evm::CodeChunkLoad { chunk, is_cold: self.is_cold }))
     }
 
     fn target_is_empty_for_new_account_gas(

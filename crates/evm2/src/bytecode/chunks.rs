@@ -1,6 +1,6 @@
 //! Prepared TIP-1143 bytecode chunks and deployment commitments.
 
-use super::{Bytecode, JumpTable};
+use super::{Bytecode, BytecodeKind};
 use crate::interpreter::{instructions::encode_rjump_offset, op};
 use alloc::vec::Vec;
 use alloy_primitives::{B256, Bytes};
@@ -92,66 +92,27 @@ impl CodeChunk {
         if self.prepared().is_some() { usize::from(*self.bytes().last().unwrap()) } else { 0 }
     }
 
-    /// Restores an already modified chunk authenticated by the provider at ingestion.
-    /// The payload keeps its original bytes; the final byte identifies leading immediate data.
-    pub fn from_prepared(bytes: Bytes, code_size: u32, index: u32) -> Result<Self, CodeChunkError> {
+    /// Attaches account context to a provider's validated, shared chunk bytecode.
+    pub fn from_prepared(
+        bytecode: Bytecode,
+        code_size: u32,
+        index: u32,
+    ) -> Result<Self, CodeChunkError> {
+        let BytecodeKind::Chunk(layout) = bytecode.kind() else {
+            return Err(CodeChunkError::InvalidPreparation);
+        };
         let start = (index as usize)
             .checked_mul(CODE_CHUNK_SIZE)
             .ok_or(CodeChunkError::InvalidPreparation)?;
         let size = code_size as usize;
-        if !(CODE_CHUNK_SIZE + 1..=MAX_CODE_SIZE).contains(&size) || start >= size {
-            return Err(CodeChunkError::InvalidPreparation);
-        }
-        let payload_len = (size - start).min(CODE_CHUNK_SIZE);
-        if bytes.len() <= payload_len || bytes.len() > LEGACY_CODE_CHUNK_SIZE {
-            return Err(CodeChunkError::InvalidPreparation);
-        }
-        let start_offset = usize::from(*bytes.last().unwrap());
-        if start_offset > payload_len.min(32) || (index == 0 && start_offset != 0) {
-            return Err(CodeChunkError::InvalidPreparation);
-        }
-        let mut instruction_end = start_offset;
-        while instruction_end < payload_len {
-            instruction_end += instruction_len(bytes[instruction_end]);
-        }
-        let tail_offset = payload_len + 32;
-        let continuation_len = instruction_end - payload_len;
-        if bytes.get(instruction_end..tail_offset)
-            != Some(padding_suffix(continuation_len).as_slice())
+        if !(CODE_CHUNK_SIZE + 1..=MAX_CODE_SIZE).contains(&size)
+            || start >= size
+            || layout.payload_len() != (size - start).min(CODE_CHUNK_SIZE)
+            || (index == 0 && bytecode.original_byte_slice().last() != Some(&0))
+            || layout.transfers != (start + usize::from(layout.padding_start) < size)
         {
             return Err(CodeChunkError::InvalidPreparation);
         }
-        let next_chunk = (start + instruction_end < size).then_some(index + 1);
-        let tail: &[u8] = if next_chunk.is_some() { &[op::RJUMP, 0x5a, 0x38] } else { &[op::STOP] };
-        if bytes.get(tail_offset..bytes.len() - 1) != Some(tail) {
-            return Err(CodeChunkError::InvalidPreparation);
-        }
-        // The prefix belongs to the preceding instruction, even if it contains JUMPDEST.
-        // Preserve the existing PUSH-only jump analysis after the first real opcode.
-        let mut jumps = JumpTable::new(bytes.len());
-        let mut pc = start_offset;
-        while pc < payload_len {
-            let opcode = bytes[pc];
-            if opcode == op::JUMPDEST {
-                jumps.as_mut_slice()[pc / 8] |= 1 << (pc % 8);
-            }
-            pc += if (op::PUSH1..=op::PUSH32).contains(&opcode) {
-                usize::from(opcode - op::PUSH1) + 2
-            } else {
-                1
-            };
-        }
-        // Only generated padding JUMPDESTs are valid physical destinations beyond the payload.
-        for pc in instruction_end..tail_offset {
-            if bytes[pc] == op::JUMPDEST {
-                jumps.as_mut_slice()[pc / 8] |= 1 << (pc % 8);
-            }
-        }
-        let padded = Bytecode::new_legacy(bytes);
-        // SAFETY: new_legacy supplies ordinary safety padding for all immediate reads.
-        // The map has one bit per stored byte and excludes prefix data and generated tails.
-        let bytecode =
-            unsafe { Bytecode::new_analyzed(padded.bytes().clone(), padded.len(), jumps) };
         Ok(Self::Prepared(PreparedCodeChunk { bytecode, code_size, index }))
     }
 
@@ -216,11 +177,7 @@ impl CodeMetadata {
     /// Validates the last chunk size and ordered hash count.
     /// Payload authentication belongs to ingestion.
     pub fn new(last_chunk_size: u32, chunk_hashes: Vec<B256>) -> Result<Self, CodeChunkError> {
-        if !(1..=CODE_CHUNK_SIZE as u32).contains(&last_chunk_size)
-            || !(2..=MAX_CODE_CHUNKS).contains(&chunk_hashes.len())
-        {
-            return Err(CodeChunkError::InvalidMetadata);
-        }
+        validate_metadata(last_chunk_size, chunk_hashes.len())?;
         Ok(Self { last_chunk_size, chunk_hashes })
     }
 
@@ -250,6 +207,70 @@ impl CodeMetadata {
     pub const fn last_chunk_size(&self) -> u32 {
         self.last_chunk_size
     }
+}
+
+/// Borrowed chunk metadata read directly from an account extension's encoded bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CodeMetadataRef<'a> {
+    last_chunk_size: u32,
+    chunk_hashes: &'a [[u8; 32]],
+}
+
+impl<'a> CodeMetadataRef<'a> {
+    /// Validates `last_chunk_size_be_u32 || chunk_hashes` without allocating.
+    pub fn from_encoded(bytes: &'a [u8]) -> Result<Self, CodeChunkError> {
+        let Some((size, hashes)) = bytes.split_first_chunk::<4>() else {
+            return Err(CodeChunkError::InvalidMetadata);
+        };
+        let (chunk_hashes, trailing) = hashes.as_chunks::<32>();
+        let last_chunk_size = u32::from_be_bytes(*size);
+        if !trailing.is_empty() {
+            return Err(CodeChunkError::InvalidMetadata);
+        }
+        validate_metadata(last_chunk_size, chunk_hashes.len())?;
+        Ok(Self { last_chunk_size, chunk_hashes })
+    }
+
+    /// Complete original code size derived from the count and final chunk size.
+    pub const fn code_size(&self) -> u32 {
+        (self.chunk_hashes.len() as u32 - 1) * CODE_CHUNK_SIZE as u32 + self.last_chunk_size
+    }
+
+    /// Number of committed runtime chunks.
+    pub const fn chunk_count(&self) -> usize {
+        self.chunk_hashes.len()
+    }
+
+    /// Hash at the given logical chunk index.
+    pub fn chunk_hash(&self, index: u32) -> Option<B256> {
+        self.chunk_hashes.get(index as usize).copied().map(B256::from)
+    }
+
+    /// Logical payload size for an in-range chunk index.
+    pub fn chunk_len(&self, index: u32) -> Option<usize> {
+        let index = index as usize;
+        (index < self.chunk_hashes.len()).then(|| {
+            if index == self.chunk_hashes.len() - 1 {
+                self.last_chunk_size as usize
+            } else {
+                CODE_CHUNK_SIZE
+            }
+        })
+    }
+
+    /// Original bytes in the last chunk.
+    pub const fn last_chunk_size(&self) -> u32 {
+        self.last_chunk_size
+    }
+}
+
+fn validate_metadata(last_chunk_size: u32, chunk_count: usize) -> Result<(), CodeChunkError> {
+    if !(1..=CODE_CHUNK_SIZE as u32).contains(&last_chunk_size)
+        || !(2..=MAX_CODE_CHUNKS).contains(&chunk_count)
+    {
+        return Err(CodeChunkError::InvalidMetadata);
+    }
+    Ok(())
 }
 
 /// Deployment or metadata validation failure.
@@ -337,7 +358,12 @@ pub fn code_chunk(code: &Bytes, index: u32) -> Option<CodeChunk> {
         bytes.push(op::STOP);
     }
     bytes.push(leading as u8);
-    CodeChunk::from_prepared(bytes.into(), code.len().try_into().ok()?, index).ok()
+    CodeChunk::from_prepared(
+        Bytecode::new_chunk(bytes.into()).ok()?,
+        code.len().try_into().ok()?,
+        index,
+    )
+    .ok()
 }
 
 /// Checked aggregate incremental tariff for one operation.
@@ -391,6 +417,64 @@ impl PreparedCodeChunk {
 
     /// Local position of the generated RJUMP or STOP.
     pub const fn tail_offset(&self) -> usize {
+        self.payload_len() + 32
+    }
+}
+
+/// Validated physical layout of a prepared bytecode buffer, independent of account context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ChunkLayout {
+    payload_len: u16,
+    padding_start: u16,
+    transfers: bool,
+}
+
+impl ChunkLayout {
+    /// Validates stored bytes before the ordinary in-memory safety padding is added.
+    pub(super) fn decode(bytes: &[u8]) -> Result<Self, CodeChunkError> {
+        let invalid = CodeChunkError::InvalidPreparation;
+        if bytes.len() > LEGACY_CODE_CHUNK_SIZE {
+            return Err(invalid);
+        }
+        let Some((&start_offset, code)) = bytes.split_last() else { return Err(invalid) };
+        let (tail_len, transfers) = if code.ends_with(&[op::STOP]) {
+            (1, false)
+        } else if code.ends_with(&[op::RJUMP, 0x5a, 0x38]) {
+            (3, true)
+        } else {
+            return Err(invalid);
+        };
+        let payload_len = code.len().checked_sub(32 + tail_len).ok_or(invalid)?;
+        if !(1..=CODE_CHUNK_SIZE).contains(&payload_len)
+            || usize::from(start_offset) > payload_len.min(32)
+        {
+            return Err(invalid);
+        }
+        let mut padding_start = usize::from(start_offset);
+        while padding_start < payload_len {
+            padding_start += instruction_len(code[padding_start]);
+        }
+        let tail_offset = payload_len + 32;
+        let continuation_len = padding_start - payload_len;
+        if code.get(padding_start..tail_offset) != Some(padding_suffix(continuation_len).as_slice())
+        {
+            return Err(invalid);
+        }
+        Ok(Self { payload_len: payload_len as u16, padding_start: padding_start as u16, transfers })
+    }
+
+    /// Number of original code positions represented by the buffer.
+    pub const fn payload_len(self) -> usize {
+        self.payload_len as usize
+    }
+
+    /// First generated padding instruction, after any continued immediate.
+    pub(super) const fn padding_start(self) -> usize {
+        self.padding_start as usize
+    }
+
+    /// Local position of the generated transfer or STOP instruction.
+    pub const fn tail_offset(self) -> usize {
         self.payload_len() + 32
     }
 }

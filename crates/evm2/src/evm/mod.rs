@@ -173,11 +173,14 @@ pub use tx::{ExecutedTx, TxResult, TxResultExt, TxResultWithState};
 
 mod state;
 pub use state::{
-    AccountChangeRef, AccountCodeChunk, AccountExtension, AccountHandle, AccountInfo,
-    BlockStateAccumulator, CodeChunkHandle, JournalEntry, NoopChangeSink, PendingState, State,
-    StateChangeSink, StateChangeSource, StateCheckpoint, StateInner, StateSnapshot, StorageChange,
-    StorageHandle, StorageOverlay, StorageSlot, StorageSlotHandle, Tee, Tracked,
+    AccountChangeRef, AccountCodeChunk, AccountHandle, AccountInfo, BlockStateAccumulator,
+    CodeChunkHandle, JournalEntry, NoopChangeSink, PendingState, State, StateChangeSink,
+    StateChangeSource, StateCheckpoint, StateInner, StateSnapshot, StorageChange, StorageHandle,
+    StorageOverlay, StorageSlot, StorageSlotHandle, Tee, Tracked,
 };
+
+#[cfg(feature = "account-ext")]
+pub use state::AccountExtension;
 
 mod prewarm_set;
 pub use prewarm_set::PrewarmSet;
@@ -1290,11 +1293,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
 
             if let Some(prepared) = prepared {
                 for (hash, chunk) in prepared {
-                    self.state
-                        .overlay_db_mut()
-                        .cache
-                        .code_chunks
-                        .insert(hash, chunk.as_bytecode().original_bytes());
+                    self.state.overlay_db_mut().cache.code_chunks.insert(hash, chunk.bytecode());
                 }
             }
             output
@@ -1575,19 +1574,16 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
         &mut self,
         address: &Address,
         index: u32,
-    ) -> Result<Option<crate::bytecode::CodeChunk>, HostError> {
-        Ok(self.state.load_code_chunk(address, index)?.map(|mut chunk| {
-            chunk.warm();
-            chunk.get().clone()
+        skip_cold: bool,
+    ) -> Result<Option<CodeChunkLoad>, HostError> {
+        Ok(self.state.load_code_chunk(address, index, skip_cold)?.map(|mut chunk| {
+            let is_cold = chunk.warm();
+            CodeChunkLoad { chunk: chunk.get().clone(), is_cold }
         }))
     }
 
     fn is_precompile(&self, address: &Address) -> bool {
         self.precompiles.contains(address)
-    }
-
-    fn code_chunk_is_warm(&self, address: &Address, index: u32) -> bool {
-        self.state.code_chunk_is_warm(address, index)
     }
 
     fn target_is_empty_for_new_account_gas(
@@ -1780,6 +1776,15 @@ pub struct AccountLoad {
     pub _non_exhaustive: (),
 }
 
+/// Result of a code chunk host load, including its warmth before access.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeChunkLoad {
+    /// Shared runtime chunk.
+    pub chunk: crate::bytecode::CodeChunk,
+    /// Whether this access warmed a cold chunk.
+    pub is_cold: bool,
+}
+
 /// Result of an `SLOAD` host operation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct SLoad {
@@ -1883,7 +1888,7 @@ fn eip7708_transfer_log(from: &Address, to: &Address, value: &Word) -> Option<Lo
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "account-ext"))]
 mod code_loading_tests;
 
 #[cfg(test)]
@@ -1891,7 +1896,7 @@ mod tests {
     use super::*;
     use crate::{
         BaseEvmConfigSelector, BaseEvmTypes, NoopInspector, Precompiles, SpecId, Version,
-        bytecode::{Bytecode, CODE_CHUNK_SIZE, MAX_CODE_SIZE, MAX_INITCODE_SIZE},
+        bytecode::Bytecode,
         env::{BlockEnvExt, TxEnvExt},
         ethereum::{RecoveredTxEnvelope, TxEnvelope, ethereum_tx_registry},
         interpreter::{GasTracker, Interpreter, Message, MessageExt, MessageKind, op},
@@ -1908,6 +1913,9 @@ mod tests {
         fmt,
         sync::atomic::{AtomicUsize, Ordering},
     };
+
+    #[cfg(feature = "account-ext")]
+    use crate::bytecode::{CODE_CHUNK_SIZE, MAX_CODE_SIZE, MAX_INITCODE_SIZE};
 
     const TEST_TX_TYPE: u8 = 0x00;
     const TEST_PRECOMPILE: Address = Address::with_last_byte(0x42);
@@ -3381,7 +3389,7 @@ mod tests {
             fn get_code_chunk_by_hash(
                 &mut self,
                 chunk_hash: &B256,
-            ) -> Result<Option<alloy_primitives::Bytes>, Self::Error> {
+            ) -> Result<Option<Bytecode>, Self::Error> {
                 let _ = chunk_hash;
                 Ok(None)
             }
@@ -3500,7 +3508,7 @@ mod tests {
             fn get_code_chunk_by_hash(
                 &mut self,
                 chunk_hash: &B256,
-            ) -> Result<Option<alloy_primitives::Bytes>, Self::Error> {
+            ) -> Result<Option<Bytecode>, Self::Error> {
                 let _ = chunk_hash;
                 Ok(None)
             }
@@ -4156,6 +4164,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "account-ext")]
     fn large_initcode_evm() -> Evm<'static, BaseEvmTypes> {
         let mut version = Version::base(SpecId::OSAKA).with_tip1143(true);
         version.max_code_size = MAX_CODE_SIZE;
@@ -4171,6 +4180,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "account-ext")]
     fn large_initcode(stop: u8, runtime_size: usize) -> Bytes {
         let target = MAX_INITCODE_SIZE - 32;
         let mut code = vec![op::STOP; MAX_INITCODE_SIZE];
@@ -4207,6 +4217,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "account-ext")]
     fn large_initcode_creation_commits_only_on_success() {
         for (stop, gas_limit, expected) in [
             (op::RETURN, 10_000_000, InstrStop::Return),
@@ -4233,7 +4244,7 @@ mod tests {
                 let metadata = account.get().unwrap().code_metadata().unwrap();
                 assert_eq!(metadata.code_size() as usize, CODE_CHUNK_SIZE + 3);
                 assert_eq!(metadata.last_chunk_size(), 3);
-                assert_eq!(metadata.chunk_hashes().len(), 2);
+                assert_eq!(metadata.chunk_count(), 2);
             } else {
                 assert!(account.get().is_none());
             }
@@ -4249,6 +4260,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "account-ext")]
     fn large_initcode_factory_create_and_create2_rollback() {
         let factory = Address::with_last_byte(0x72);
         let initcode = large_initcode(op::RETURN, 1);
@@ -4316,6 +4328,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "account-ext")]
     fn large_initcode_enforces_complete_input_limit() {
         let mut evm = large_initcode_evm();
         let mut message = MessageExt {
@@ -4330,6 +4343,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "account-ext")]
     fn large_initcode_creation_transaction() {
         let mut evm = large_initcode_evm();
         // A 2 MiB input exceeds Osaka's default transaction cap under the data gas floor.

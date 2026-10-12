@@ -3,7 +3,7 @@
 use super::{NonStaticAny, state::AccountInfo};
 use crate::{DatabaseError, bytecode::Bytecode, interpreter::Word};
 use alloc::{boxed::Box, string::ToString};
-use alloy_primitives::{Address, B256, Bytes, keccak256};
+use alloy_primitives::{Address, B256, keccak256};
 use auto_impl::auto_impl;
 use core::error::Error;
 
@@ -31,15 +31,13 @@ pub trait Database: NonStaticAny {
     /// Loads bytecode by code hash.
     fn get_code_by_hash(&mut self, code_hash: &B256) -> Result<Bytecode, Self::Error>;
 
-    /// Loads a stored prepared buffer by its chunk hash, including its padding and trailer.
-    /// The account metadata supplies the logical index and size. Never reconstruct full code.
-    fn get_code_chunk_by_hash(&mut self, chunk_hash: &B256) -> Result<Option<Bytes>, Self::Error>;
-
-    /// Discards a raw response rejected by contextual execution validation.
-    /// Cache adapters must evict and forward this notification to their backing adapter.
-    fn discard_code_chunk(&mut self, chunk_hash: &B256) {
-        let _ = chunk_hash;
-    }
+    /// Loads shared chunk bytecode by its stored-buffer hash, including padding and trailer.
+    /// Construct with [`Bytecode::new_chunk`]. Account metadata supplies the logical index
+    /// and size. Never reconstruct full code.
+    fn get_code_chunk_by_hash(
+        &mut self,
+        chunk_hash: &B256,
+    ) -> Result<Option<Bytecode>, Self::Error>;
 
     /// Loads a persistent storage slot.
     fn get_storage(&mut self, address: &Address, key: &Word) -> Result<Word, Self::Error>;
@@ -91,11 +89,7 @@ impl<T: Database> Db<T> {
 }
 
 impl<T: Database> DynDatabase for Db<T> {
-    fn discard_code_chunk(&mut self, chunk_hash: &B256) {
-        self.db.discard_code_chunk(chunk_hash);
-    }
-
-    fn get_code_chunk_by_hash(&mut self, chunk_hash: &B256) -> DbResult<Option<Bytes>> {
+    fn get_code_chunk_by_hash(&mut self, chunk_hash: &B256) -> DbResult<Option<Bytecode>> {
         self.db.get_code_chunk_by_hash(chunk_hash).map_err(|err| {
             let fatal = T::is_fatal(&err);
             DatabaseError::new(err, fatal)
@@ -143,14 +137,8 @@ pub trait DynDatabase: NonStaticAny {
     /// Loads bytecode by code hash.
     fn get_code_by_hash(&mut self, code_hash: &B256) -> DbResult<Bytecode>;
 
-    /// Loads a stored prepared buffer by its chunk hash, without full-code reconstruction.
-    fn get_code_chunk_by_hash(&mut self, chunk_hash: &B256) -> DbResult<Option<Bytes>>;
-
-    /// Discards a raw response rejected by contextual execution validation.
-    /// Cache adapters must evict and forward this notification to their backing adapter.
-    fn discard_code_chunk(&mut self, chunk_hash: &B256) {
-        let _ = chunk_hash;
-    }
+    /// Loads shared chunk bytecode by its stored-buffer hash, without full-code reconstruction.
+    fn get_code_chunk_by_hash(&mut self, chunk_hash: &B256) -> DbResult<Option<Bytecode>>;
 
     /// Loads a persistent storage slot.
     fn get_storage(&mut self, address: &Address, key: &Word) -> DbResult<Word>;
@@ -266,11 +254,7 @@ impl<D> DbStats<D> {
 }
 
 impl<D: DynDatabase> DynDatabase for DbStats<D> {
-    fn discard_code_chunk(&mut self, chunk_hash: &B256) {
-        self.db.discard_code_chunk(chunk_hash);
-    }
-
-    fn get_code_chunk_by_hash(&mut self, chunk_hash: &B256) -> DbResult<Option<Bytes>> {
+    fn get_code_chunk_by_hash(&mut self, chunk_hash: &B256) -> DbResult<Option<Bytecode>> {
         self.counts.get_code_chunk_by_hash += 1;
         self.db.get_code_chunk_by_hash(chunk_hash)
     }
@@ -325,7 +309,10 @@ pub(crate) fn boxed_dyn_database<'a>(database: impl DynDatabase + 'a) -> Box<dyn
 pub struct EmptyDB(());
 
 impl Database for EmptyDB {
-    fn get_code_chunk_by_hash(&mut self, chunk_hash: &B256) -> Result<Option<Bytes>, Self::Error> {
+    fn get_code_chunk_by_hash(
+        &mut self,
+        chunk_hash: &B256,
+    ) -> Result<Option<Bytecode>, Self::Error> {
         let _ = chunk_hash;
         Ok(None)
     }
@@ -353,7 +340,7 @@ impl Database for EmptyDB {
 }
 
 impl DynDatabase for EmptyDB {
-    fn get_code_chunk_by_hash(&mut self, chunk_hash: &B256) -> DbResult<Option<Bytes>> {
+    fn get_code_chunk_by_hash(&mut self, chunk_hash: &B256) -> DbResult<Option<Bytecode>> {
         let _ = chunk_hash;
         Ok(None)
     }
@@ -387,7 +374,7 @@ mod tests {
     }
 
     impl DynDatabase for BorrowingDb<'_> {
-        fn get_code_chunk_by_hash(&mut self, chunk_hash: &B256) -> DbResult<Option<Bytes>> {
+        fn get_code_chunk_by_hash(&mut self, chunk_hash: &B256) -> DbResult<Option<Bytecode>> {
             let _ = chunk_hash;
             Ok(None)
         }

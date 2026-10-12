@@ -1323,7 +1323,7 @@ mod tests {
         fn get_code_chunk_by_hash(
             &mut self,
             chunk_hash: &B256,
-        ) -> Result<Option<alloy_primitives::Bytes>, Self::Error> {
+        ) -> Result<Option<Bytecode>, Self::Error> {
             let _ = chunk_hash;
             Ok(None)
         }

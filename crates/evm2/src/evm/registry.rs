@@ -489,11 +489,9 @@ mod tests {
             &mut self,
             _: &Address,
             _: u32,
-        ) -> Result<Option<crate::bytecode::CodeChunk>, crate::HostError> {
+            _: bool,
+        ) -> Result<Option<crate::evm::CodeChunkLoad>, crate::HostError> {
             Ok(None)
-        }
-        fn code_chunk_is_warm(&self, _: &Address, _: u32) -> bool {
-            false
         }
 
         fn target_is_empty_for_new_account_gas(
