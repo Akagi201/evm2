@@ -1,6 +1,7 @@
 //! Owned errors crossing database and execution boundaries.
 
 use alloc::{string::String, sync::Arc};
+use alloy_primitives::B256;
 use core::{error::Error, fmt};
 
 /// Type-erased host error.
@@ -96,6 +97,12 @@ impl DatabaseError {
     pub fn downcast_ref<E: Error + 'static>(&self) -> Option<&E> {
         self.error.downcast_ref()
     }
+
+    /// Classifies a required provider read as fatal while preserving its concrete error.
+    pub(crate) const fn into_fatal(mut self) -> Self {
+        self.fatal = true;
+        self
+    }
 }
 
 /// A state load can be skipped before reading a cold account or slot.
@@ -153,22 +160,15 @@ impl From<crate::interpreter::InstrStop> for HostError {
 }
 
 /// A required runtime payload could not be obtained from the trusted provider.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error(
-    "code chunk {code_hash} index {index}: {reason}; expected {expected_length:?}, got {actual_length:?}"
-)]
-pub struct CodeChunkError {
-    /// Global original code hash.
-    pub code_hash: alloy_primitives::B256,
-    /// Requested payload index.
-    pub index: u32,
-    /// Exact committed length, or unknown for a legacy record (bounded to 1..=24576).
-    pub expected_length: Option<usize>,
-    /// Returned payload length when bytes were supplied.
-    pub actual_length: Option<usize>,
-    /// Failure classification independent of provider error text.
-    pub reason: &'static str,
-    /// Original provider error when the request failed.
-    #[source]
-    pub source: Option<DatabaseError>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CodeChunkLoadError {
+    /// Required code or prepared chunk is absent, identified by its committed hash.
+    #[error("missing code payload {0}")]
+    Missing(B256),
+    /// Code or prepared chunk has an invalid length or preparation context.
+    #[error("invalid code payload {0}")]
+    Invalid(B256),
+    /// Inline delegation metadata does not match the account's code hash.
+    #[error("invalid inline delegation metadata for {0}")]
+    InvalidDelegation(B256),
 }

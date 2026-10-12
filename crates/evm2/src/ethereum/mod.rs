@@ -638,9 +638,7 @@ pub fn prepare_initial_frame<'a, T: EvmTypes>(
                 caller,
                 input: input.clone(),
                 value,
-                code_chunk: (code).into(),
-                code_source: None,
-                code_size: 0,
+                code: (code).into(),
                 code_hash: B256::ZERO,
                 code_address,
                 disable_precompiles,
@@ -673,15 +671,11 @@ pub fn prepare_initial_frame<'a, T: EvmTypes>(
                 caller,
                 input: input.clone(),
                 value,
-                code_chunk: if host.feature(EvmFeatures::TIP1143) {
-                    Default::default()
+                code: if host.feature(EvmFeatures::TIP1143) {
+                    CodeSource::Initcode(input.clone())
                 } else {
                     Bytecode::new_legacy(input.clone()).into()
                 },
-                code_source: host
-                    .feature(EvmFeatures::TIP1143)
-                    .then(|| CodeSource::Initcode(input.clone())),
-                code_size: input.len(),
                 code_hash: B256::ZERO,
                 code_address: destination,
                 disable_precompiles: false,
@@ -1005,14 +999,12 @@ fn prepare_initial_chunked_frame<T: EvmTypes>(
     }
     let mut code = Bytecode::default();
     let mut code_chunk = None;
-    let mut code_size = 0;
     if (!native || disable_precompiles)
         && !account.code_hash.is_zero()
         && account.code_hash != alloy_primitives::KECCAK256_EMPTY
     {
         if let Some(target) = account.inline_delegation {
             code = Bytecode::new_eip7702(target);
-            code_size = code.len();
         } else {
             let tariff = if host.state.code_chunk_is_warm(&owner, 0) {
                 WARM_CODE_CHUNK_GAS
@@ -1022,18 +1014,11 @@ fn prepare_initial_chunked_frame<T: EvmTypes>(
             if tx_gas.spend(tariff).is_err() {
                 return Ok(None);
             }
-            let loaded = match Host::load_code_chunk(host, &owner, 0, false) {
+            let loaded = match Host::load_code_chunk(host, &owner, 0) {
                 Ok(Some(loaded)) => loaded,
                 Ok(None) => {
                     return Err(crate::DatabaseError::new(
-                        crate::CodeChunkError {
-                            code_hash: account.code_hash,
-                            index: 0,
-                            expected_length: None,
-                            actual_length: None,
-                            reason: "missing required entry chunk",
-                            source: None,
-                        },
+                        crate::CodeChunkLoadError::Missing(account.code_hash),
                         true,
                     )
                     .into());
@@ -1041,8 +1026,8 @@ fn prepare_initial_chunked_frame<T: EvmTypes>(
                 Err(HostError::Halt(_)) => return Ok(None),
                 Err(HostError::Execution(error)) => return Err(error.into()),
             };
-            code_size = account.code_size.map_or(loaded.chunk.payload_len(), |size| size as usize);
-            code_chunk = Some(loaded.chunk);
+
+            code_chunk = Some(loaded);
         }
     }
     Ok(Some(InitialFrame {
@@ -1057,9 +1042,7 @@ fn prepare_initial_chunked_frame<T: EvmTypes>(
             caller,
             input: input.clone(),
             value,
-            code_source: code_chunk.as_ref().map(|_| CodeSource::Account),
-            code_chunk: code_chunk.unwrap_or_else(|| (code).into()),
-            code_size,
+            code: code_chunk.map_or_else(|| code.into(), CodeSource::Account),
             code_hash: account.code_hash,
             code_address: owner,
             disable_precompiles,

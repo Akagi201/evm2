@@ -1,6 +1,6 @@
 use crate::{
     EvmFeatures, EvmTypesHost,
-    bytecode::{Bytecode, CODE_CHUNK_SIZE, LEGACY_CODE_CHUNK_SIZE},
+    bytecode::{Bytecode, LEGACY_CODE_CHUNK_SIZE},
     evm::AccountLoad,
     interpreter::{
         CodeSource, Gas, Host, InstrStop, Memory, Result, Word, private::GasInstructionCx,
@@ -11,7 +11,7 @@ use crate::{
     version::GasParams,
 };
 use alloc::vec::Vec;
-use alloy_primitives::{Address, B256, KECCAK256_EMPTY};
+use alloy_primitives::{B256, KECCAK256_EMPTY};
 use evm2_macros::instruction;
 
 fn load_account<T: EvmTypesHost>(
@@ -114,7 +114,7 @@ pub fn codecopy(cx: _, [memory_offset, code_offset, len]: [Word]) -> Result {
     // SAFETY: Charging and copying data make no host calls.
     let gas_params = unsafe { cx.state.gas_params_detached() };
     cx.gas.spend(gas_params.copy_cost(len))?;
-    if let Some(CodeSource::Initcode(bytes)) = &cx.state.message().code_source {
+    if let CodeSource::Initcode(bytes) = &cx.state.message().code {
         let bytes = bytes.clone();
         return copy_data(
             cx.gas,
@@ -134,12 +134,12 @@ pub fn codecopy(cx: _, [memory_offset, code_offset, len]: [Word]) -> Result {
         cx.state.resize_memory(cx.gas, offset, len)?;
         let owner = cx.state.message().code_address;
         let size = cx.state.code_size();
-        let multi = cx.state.message().code_chunk.prepared().is_some();
-        let bytes = load_code_range(&mut cx, owner, *code_offset, len, size, multi, false)?;
+        let multi = cx.state.active_chunk().prepared().is_some();
+        let bytes = cx.state.load_code_range(cx.gas, owner, *code_offset, len, size, multi)?;
         cx.state.0.memory.set_data(offset, 0, len, &bytes);
         return Ok(());
     }
-    let data = cx.state.0.bytecode.original_byte_slice();
+    let data = cx.state.0.code.active().as_bytecode().original_byte_slice();
     copy_data(cx.gas, &mut cx.state.0.memory, gas_params, memory_offset, code_offset, len, data)
 }
 
@@ -198,14 +198,19 @@ pub fn extcodecopy(cx: _, [addr, memory_offset, code_offset, len]: [Word]) -> Re
         } else if account.code_hash.is_zero() || account.code_hash == KECCAK256_EMPTY {
             Vec::new()
         } else {
-            load_code_range(
-                &mut cx,
+            cx.state.load_code_range(
+                cx.gas,
                 word_to_address(*addr),
                 *code_offset,
                 len,
-                account.code_size.unwrap_or(LEGACY_CODE_CHUNK_SIZE as u32) as usize,
+                if account.is_chunked {
+                    account.code_size.expect("chunked size") as usize
+                } else {
+                    // Legacy reads charge chunk zero below the fixed limit, even if its
+                    // actual size is already cached. Residency must not change gas.
+                    LEGACY_CODE_CHUNK_SIZE
+                },
                 account.is_chunked,
-                true,
             )?
         };
         cx.state.0.memory.set_data(memory_offset, 0, len, &bytes);
@@ -240,48 +245,6 @@ pub fn returndatacopy(cx: _, [memory_offset, data_offset, len]: [Word]) -> Resul
     let data = &cx.state.0.return_data;
     let data_offset = Word::from(data_offset);
     copy_data(cx.gas, &mut cx.state.0.memory, gas_params, memory_offset, &data_offset, len, data)
-}
-
-/// Reserves the complete known range tariff before its first payload read.
-fn load_code_range<T: EvmTypesHost>(
-    cx: &mut GasInstructionCx<'_, '_, '_, T>,
-    code_owner: Address,
-    source: Word,
-    len: usize,
-    size: usize,
-    multi: bool,
-    legacy_external: bool,
-) -> Result<Vec<u8>> {
-    if len == 0 {
-        return Ok(Vec::new());
-    }
-    let source = word_to_usize_saturated(source);
-    let bound = if legacy_external && !multi { LEGACY_CODE_CHUNK_SIZE } else { size };
-    if source >= bound {
-        return Ok(Vec::new());
-    }
-    let end = source.saturating_add(len).min(size);
-    let (first, last) = if multi {
-        ((source / CODE_CHUNK_SIZE) as u32, ((end - 1) / CODE_CHUNK_SIZE) as u32)
-    } else {
-        (0, 0)
-    };
-    let mut cost = 0;
-    for index in first..=last {
-        cost += cx.state.chunk_tariff(&code_owner, index);
-    }
-    cx.gas.spend(cost)?;
-    let mut bytes = Vec::new();
-    for index in first..=last {
-        let chunk = cx.state.required_code_chunk(&code_owner, index)?;
-        let base = if multi { index as usize * CODE_CHUNK_SIZE } else { 0 };
-        let from = source.saturating_sub(base).min(chunk.payload_len());
-        let to = end.saturating_sub(base).min(chunk.payload_len());
-        if from < to {
-            bytes.extend_from_slice(&chunk.bytes()[from..to]);
-        }
-    }
-    Ok(bytes)
 }
 
 #[cfg(test)]

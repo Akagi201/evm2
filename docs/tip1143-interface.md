@@ -4,7 +4,13 @@ This is an opt-in, unscheduled draft. It does not select an activation date or c
 
 ## Logical code and stored chunks
 
-`Version::with_tip1143(bool)` controls `EvmFeatures::TIP1143`. Logical runtime slices contain at most 24,540 bytes (`24 KiB - 36`), up to 40 slices and 981,600 bytes in total. Initcode has a separate 2,097,152-byte (2 MiB) limit and is prepared for execution in chunks on demand. Chunk tariffs are provisionally 28,680 cold and 1,000 warm gas. Disabling the draft restores the previous limits.
+`Version::with_tip1143(bool)` controls only `EvmFeatures::TIP1143`. Set `Version::max_code_size` and `Version::max_initcode_size` explicitly; toggling the feature preserves those values. `CODE_CHUNK_SIZE` fixes the logical runtime slice size at 24,540 bytes (`24 KiB - 36`), with a format capacity of 40 slices and 981,600 bytes in total. The draft limits are available as `bytecode::MAX_CODE_SIZE` and `bytecode::MAX_INITCODE_SIZE`; initcode's limit is 2,097,152 bytes (2 MiB). Initcode is prepared for execution in chunks on demand. Chunk tariffs are provisionally 28,680 cold and 1,000 warm gas.
+
+```rust
+let mut version = Version::base(SpecId::OSAKA).with_tip1143(true);
+version.max_code_size = evm2::bytecode::MAX_CODE_SIZE;
+version.max_initcode_size = evm2::bytecode::MAX_INITCODE_SIZE;
+```
 
 Each prepared chunk has this stored format:
 
@@ -50,23 +56,31 @@ Code setters, `set_extension`, and `set_info` invalidate account-local chunks im
 
 ## Provider and cache contract
 
-Typed, erased, counted and asynchronous database interfaces require `get_code_chunk_by_hash(hash, index) -> Result<Option<CodeChunk>, Error>`. Code type comes from `get_account`; no separate kind lookup is required. There is no default multi-chunk full-code fallback. A chunked request returns the persisted prepared Bytecode and its scalar context. Providers authenticate its identity at ingestion; execution validates context without rehashing every payload.
+Typed, erased, counted and asynchronous database interfaces require `get_code_chunk_by_hash(chunk_hash) -> Result<Option<Bytes>, Error>`. Account metadata selects the chunk hash by logical index. The provider returns the stored prepared buffer; the state loader supplies the account's complete size and requested index to `CodeChunk::from_prepared`. Code type comes from `get_account`; legacy code uses `get_code_by_hash`. There is no full-code fallback for chunk requests. Providers authenticate content at ingestion; execution validates preparation context without rehashing every payload.
 
 Legacy account execution uses the explicit `get_code_by_hash` record operation after reserving its chunk-zero gas. This preserves an unchanged 24,576-byte legacy record even if another account with the same hash uses the new stride. The selected account representation, not descriptor presence or payload length, chooses the operation. Chunked requests must not use a cached full original record to hide missing prepared data.
 
 `Cache::insert_code` records original code without automatically splitting historical records. Account insertion publishes prepared chunks only when account metadata selects that representation. Creation prepares its chunks before publication. Original and prepared caches retain immutable data across transaction reset and revert.
 
-Prepared entries are keyed by `(global_code_hash, index)`. Each `CodeChunk` shares its Bytecode allocation and lazy analysis across clones; no separate analyzed-chunk map or alternate execution buffers are needed. Prepared hashes include the fixed padding, tails and offset bytes.
+Persisted buffers and the raw provider cache are keyed by chunk hash, so identical buffers can be shared across contracts and logical positions. Prepared hashes include the fixed padding, tails and offset bytes. Account state caches validated `CodeChunk` values by index, with transaction warmth stored alongside them. Each loaded `CodeChunk` shares its Bytecode allocation and analysis with the interpreter; its scalar context identifies the logical index and complete code size.
 
-`State::load_code_chunk` returns a `CodeChunkHandle` after checking bounds, skipped cold accesses, payload length and preparation context. Loading does not change warmth or record a journal entry. The handle exposes `get()` and `is_warm()`; `warm()` marks access and journals the cold-to-warm transition, returning whether the chunk was cold. Rollback restores warmth while retaining cached bytes, as it does for storage reads. The host reserves all known chunk tariffs before loading, then explicitly warms the handle. Missing required data and corruption become node errors, never empty bytecode or EVM halts. Rejected entries are evicted through typed, cached, counted and async adapters. Physical residency never determines consensus warmth or price.
+`State::load_code_chunk` returns a `CodeChunkHandle` after checking bounds, payload length and preparation context. Loading does not change warmth or record a journal entry. The handle exposes `get()` and `is_warm()`; `warm()` marks access and journals the cold-to-warm transition, returning whether the chunk was cold. Rollback restores warmth while retaining cached bytes, as it does for storage reads. Interpreter and transaction callers reserve all known chunk tariffs before loading. `Host::load_code_chunk(address, index)` warms the handle and returns the shared `CodeChunk`; there is no skip flag or redundant cold-load result. Missing required data and corruption become node errors, never empty bytecode or EVM halts. Rejected entries are evicted through typed, cached, counted and async adapters. Physical residency never determines consensus warmth or price.
 
 Account warmth is keyed by owner and index. Journals restore warmth and code identity at rollback; transaction clearing resets logical warmth while retaining immutable bytes.
 
 ## Execution and client handoff
 
-`MessageExt::code_source` separates temporary initcode from account code. `Some(CodeSource::Account)` loads chunks through the account host and applies account warmth and tariffs. `Some(CodeSource::Initcode(bytes))` owns immutable transaction input or a snapshot of a CREATE/CREATE2 memory range. `None` executes the resident `code_chunk`, including synthesized delegation markers and pre-TIP frames. The interpreter retains one active `CodeChunk` execution view.
+`MessageExt::code` is a `CodeSource` with three variants: `Direct(Bytecode)` for complete bytecode executed directly as one buffer, `Account(CodeChunk)` for an account's entry chunk, and `Initcode(Bytes)` for immutable transaction input or a CREATE/CREATE2 memory snapshot. Size is derived from the selected source; initcode carries no unused account entry buffer.
 
-Large initcode uses one linear PUSH-boundary scan and caches execution buffers only for chunks entered by execution. Each buffer includes up to 32 original lookahead bytes for crossing immediates and ordinary zero padding at EOF. Initcode dispatch switches buffers between instructions, without executing generated padding or charging a boundary tariff. Account runtime retains its existing generated-tail layout. Jump validity follows the resident interpreter's PUSH-only analysis, including unusual byte sequences inside other immediate encodings.
+Code ownership is split into three reusable layers:
+
+- `bytecode::CodeChunk` owns immutable bytecode, analysis and logical context. Account state and interpreter frames share this value.
+- `evm::state::CodeChunkHandle` loads account chunks and journals warmth. The database handles content hashes; account state handles addresses and indices.
+- `interpreter::InterpreterCode` owns the active chunk, execution source, cached borrowed view and PC. It centralizes chunk activation and pointer lifetimes. Logical size, chunk index and tail position come from the active chunk rather than duplicate interpreter fields. Frame-local initcode preparation lives in `bytecode/chunks/initcode.rs`.
+
+Recursive calls have independent interpreter cursors. The account owns cached chunks and warmth, never an execution cursor. Returning a frame to the interpreter pool releases its code source and temporary initcode cache.
+
+Large initcode uses one linear PUSH-boundary scan and caches execution buffers only for chunks entered by execution. Each buffer includes up to 32 original lookahead bytes for crossing immediates and ordinary zero padding at EOF. Initcode dispatch switches buffers between instructions, without executing generated padding or charging a boundary tariff. Account runtime retains its existing generated-tail layout. Jump validity follows the direct interpreter's PUSH-only analysis, including unusual byte sequences inside other immediate encodings.
 
 Initcode PC and CODESIZE remain global. CODECOPY reads original input bytes directly and zero-fills out-of-range reads without preparing execution buffers. Account reads, including EXTCODECOPY and calls made by a constructor, still use account loading and tariffs. Input-word gas, CREATE2 hashing of the entire original input, memory expansion, and copy gas are unchanged. The 2 MiB size ceiling does not override transaction gas caps or the transaction data gas floor; these can impose a lower practical input limit. The initcode source and prepared cache are temporary; RETURN output alone is validated, charged for deposit, and installed. REVERT, exceptional halts, failed deposit, and enclosing-frame rollback retain ordinary creation semantics.
 
@@ -74,7 +88,7 @@ Both explicit jump opcodes use unchanged global positions. Untaken JUMPI does no
 
 Draft frames, including initcode, run through the interpreter; JIT/AOT support is deferred. Inspectors must report original PCs and omit internal padding and tails. Creation limits apply through transaction, embedding, CREATE and CREATE2 paths, while ordinary gas, memory and deposit constraints remain.
 
-Reth/Tempo must authenticate ingestion, atomically persist prepared buffers, scalar context and account type, preserve historical state views, reconstruct original RPC bytes, and use one coherent immutable dependency graph. Production inventory, replay, proof growth, provider latency, prepared-buffer costs and final tariff decisions remain activation prerequisites.
+Reth/Tempo must authenticate ingestion, atomically persist prepared buffers by chunk hash and account metadata, preserve historical state views, reconstruct original RPC bytes, and use one coherent immutable dependency graph. Production inventory, replay, proof growth, provider latency, prepared-buffer costs and final tariff decisions remain activation prerequisites.
 
 
 `RJUMPI` (`0xe1`) uses the same two-byte offset encoding and costs 4 gas. It pops one condition: nonzero jumps through the shared RJUMP target loader, while zero advances past the immediate. An untaken branch does not validate, load, charge or warm its target chunk; ordinary fallthrough can still cross a chunk boundary and execute a generated RJUMP. Invalid immediate encodings fail even for an untaken branch. Both relative opcodes are unknown when TIP-1143 is disabled.

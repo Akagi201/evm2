@@ -47,7 +47,7 @@ fn jump_inner<T: EvmTypesHost>(target: Word, cx: &mut GasInstructionCx<'_, '_, '
             if !chunk.is_valid_jumpdest(local) {
                 return Err(InstrStop::InvalidJump);
             }
-            cx.state.activate_code_chunk(index, chunk);
+            cx.state.activate_code_chunk(chunk);
             unsafe { cx.pc.set_unchecked(cx.state.bytecode(), local) };
             return Ok(());
         }
@@ -212,7 +212,7 @@ fn rjump_inner<T: EvmTypesHost>(
             }
             local
         };
-        cx.state.activate_code_chunk(index, chunk);
+        cx.state.activate_code_chunk(chunk);
         local
     } else {
         if !cx.state.bytecode().is_valid_jumpdest(target) {

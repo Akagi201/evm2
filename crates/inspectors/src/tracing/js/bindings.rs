@@ -1322,14 +1322,10 @@ mod tests {
 
         fn get_code_chunk_by_hash(
             &mut self,
-            code_hash: &B256,
-            index: u32,
-        ) -> Result<Option<evm2::bytecode::CodeChunk>, Self::Error> {
-            if index != 0 {
-                return Ok(None);
-            }
-            let code = self.get_code_by_hash(code_hash)?;
-            Ok((!code.is_empty()).then(|| evm2::bytecode::CodeChunk::from_bytecode(&code)))
+            chunk_hash: &B256,
+        ) -> Result<Option<alloy_primitives::Bytes>, Self::Error> {
+            let _ = chunk_hash;
+            Ok(None)
         }
 
         fn get_code_by_hash(&mut self, code_hash: &B256) -> Result<Bytecode, Self::Error> {

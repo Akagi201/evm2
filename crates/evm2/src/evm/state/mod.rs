@@ -3,7 +3,7 @@
 mod account;
 mod block;
 mod code_chunks;
-pub use code_chunks::{AccountCodeChunk, CodeChunkHandle, CodeChunkLoad};
+pub use code_chunks::{AccountCodeChunk, CodeChunkHandle};
 mod extension;
 mod journal;
 mod pending;

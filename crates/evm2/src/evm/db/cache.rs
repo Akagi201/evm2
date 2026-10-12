@@ -3,7 +3,7 @@
 use super::{DbResult, DynDatabase, EmptyDB};
 use crate::{
     DatabaseError,
-    bytecode::{Bytecode, CODE_CHUNK_SIZE, CodeChunk},
+    bytecode::{Bytecode, CODE_CHUNK_SIZE},
     evm::{
         bal::BalContext,
         state::{
@@ -14,8 +14,8 @@ use crate::{
     interpreter::Word,
 };
 use alloy_primitives::{
-    Address, B256, KECCAK256_EMPTY,
-    map::{AddressMap, B256Map, HashMap, U256Map, hash_map::Entry},
+    Address, B256, Bytes, KECCAK256_EMPTY,
+    map::{AddressMap, B256Map, U256Map, hash_map::Entry},
 };
 use core::convert::Infallible;
 
@@ -54,8 +54,8 @@ pub struct Cache {
     pub accounts: AddressMap<Option<AccountInfo>>,
     /// Contracts keyed by code hash.
     pub contracts: B256Map<Bytecode>,
-    /// Raw successful provider responses; execution must validate contextual lengths.
-    pub code_chunks: HashMap<(B256, u32), CodeChunk>,
+    /// Stored prepared buffers keyed by chunk hash. Execution validates their logical context.
+    pub code_chunks: B256Map<Bytes>,
     /// Persistent storage keyed by account, then slot.
     pub storage: AddressMap<AccountStorageCache>,
     /// Cached block hashes keyed by block number.
@@ -91,17 +91,16 @@ impl Cache {
         self.contracts.insert(code_hash, code.clone());
     }
 
-    fn insert_chunks(
-        chunks: &mut HashMap<(B256, u32), CodeChunk>,
-        code_hash: B256,
-        code: &Bytecode,
-    ) {
+    fn insert_chunks(chunks: &mut B256Map<Bytes>, code: &Bytecode) {
         if code.len() > CODE_CHUNK_SIZE {
             let bytes = code.original_bytes();
             for (index, _) in bytes.chunks(CODE_CHUNK_SIZE).enumerate() {
                 let index = u32::try_from(index).expect("bytecode index fits u32");
                 if let Some(chunk) = crate::bytecode::code_chunk(&bytes, index) {
-                    chunks.insert((code_hash, index), chunk);
+                    chunks.insert(
+                        chunk.as_bytecode().hash_slow(),
+                        chunk.as_bytecode().original_bytes(),
+                    );
                 }
             }
         }
@@ -117,7 +116,7 @@ impl Default for Cache {
         Self {
             accounts: AddressMap::default(),
             contracts,
-            code_chunks: HashMap::default(),
+            code_chunks: B256Map::default(),
             storage: AddressMap::default(),
             block_hashes: U256Map::default(),
             _non_exhaustive: (),
@@ -223,7 +222,7 @@ impl<ExtDB> CacheDB<ExtDB> {
     #[inline]
     fn insert_contract_inner(
         contracts: &mut B256Map<Bytecode>,
-        chunks: &mut HashMap<(B256, u32), CodeChunk>,
+        chunks: &mut B256Map<Bytes>,
         info: &mut AccountInfo,
     ) {
         if let Some(code) = &info.code
@@ -234,7 +233,7 @@ impl<ExtDB> CacheDB<ExtDB> {
             }
             contracts.entry(info.code_hash).or_insert_with(|| code.clone());
             if info.code_metadata().is_some() {
-                Cache::insert_chunks(chunks, info.code_hash, code);
+                Cache::insert_chunks(chunks, code);
             }
         }
         if info.code_hash.is_zero() {
@@ -338,31 +337,21 @@ impl<ExtDB> StateChangeSink for CacheDB<ExtDB> {
 }
 
 impl<ExtDB: DynDatabase> DynDatabase for CacheDB<ExtDB> {
-    fn discard_code_chunk(&mut self, code_hash: &B256, index: u32) {
-        self.cache.code_chunks.remove(&(*code_hash, index));
-        self.db.discard_code_chunk(code_hash, index);
+    fn discard_code_chunk(&mut self, chunk_hash: &B256) {
+        self.cache.code_chunks.remove(chunk_hash);
+        self.db.discard_code_chunk(chunk_hash);
     }
 
-    fn get_code_chunk_by_hash(
-        &mut self,
-        code_hash: &B256,
-        index: u32,
-    ) -> DbResult<Option<CodeChunk>> {
-        if *code_hash == KECCAK256_EMPTY || code_hash.is_zero() {
+    fn get_code_chunk_by_hash(&mut self, chunk_hash: &B256) -> DbResult<Option<Bytes>> {
+        if *chunk_hash == KECCAK256_EMPTY || chunk_hash.is_zero() {
             return Ok(None);
         }
-        if let Some(chunk) = self.cache.code_chunks.get(&(*code_hash, index)) {
+        if let Some(chunk) = self.cache.code_chunks.get(chunk_hash) {
             return Ok(Some(chunk.clone()));
         }
-        // Resident deployment output is authoritative, unlike a provider's optional full-code API.
-        if let Some(code) = self.cache.contracts.get(code_hash)
-            && code.len() <= CODE_CHUNK_SIZE
-        {
-            return Ok((index == 0 && !code.is_empty()).then(|| CodeChunk::from_bytecode(code)));
-        }
-        let chunk = self.db.get_code_chunk_by_hash(code_hash, index)?;
+        let chunk = self.db.get_code_chunk_by_hash(chunk_hash)?;
         if let Some(chunk) = &chunk {
-            self.cache.code_chunks.insert((*code_hash, index), chunk.clone());
+            self.cache.code_chunks.insert(*chunk_hash, chunk.clone());
         }
         Ok(chunk)
     }
@@ -464,16 +453,15 @@ mod typed {
     use crate::evm::Database;
 
     impl<ExtDB: DynDatabase> Database for CacheDB<ExtDB> {
-        fn discard_code_chunk(&mut self, code_hash: &B256, index: u32) {
-            DynDatabase::discard_code_chunk(self, code_hash, index);
+        fn discard_code_chunk(&mut self, chunk_hash: &B256) {
+            DynDatabase::discard_code_chunk(self, chunk_hash);
         }
 
         fn get_code_chunk_by_hash(
             &mut self,
-            code_hash: &B256,
-            index: u32,
-        ) -> Result<Option<CodeChunk>, Self::Error> {
-            DynDatabase::get_code_chunk_by_hash(self, code_hash, index)
+            chunk_hash: &B256,
+        ) -> Result<Option<Bytes>, Self::Error> {
+            DynDatabase::get_code_chunk_by_hash(self, chunk_hash)
         }
 
         type Error = DatabaseError;
@@ -603,14 +591,10 @@ mod tests {
 
         fn get_code_chunk_by_hash(
             &mut self,
-            code_hash: &B256,
-            index: u32,
-        ) -> Result<Option<crate::bytecode::CodeChunk>, Self::Error> {
-            if index != 0 {
-                return Ok(None);
-            }
-            let code = self.get_code_by_hash(code_hash)?;
-            Ok((!code.is_empty()).then(|| crate::bytecode::CodeChunk::from_bytecode(&code)))
+            chunk_hash: &B256,
+        ) -> Result<Option<Bytes>, Self::Error> {
+            let _ = chunk_hash;
+            Ok(None)
         }
 
         fn get_code_by_hash(&mut self, code_hash: &B256) -> Result<Bytecode, Self::Error> {

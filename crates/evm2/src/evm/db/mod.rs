@@ -1,13 +1,9 @@
 //! Database helpers for the EVM state overlay.
 
 use super::{NonStaticAny, state::AccountInfo};
-use crate::{
-    DatabaseError,
-    bytecode::{Bytecode, CodeChunk},
-    interpreter::Word,
-};
+use crate::{DatabaseError, bytecode::Bytecode, interpreter::Word};
 use alloc::{boxed::Box, string::ToString};
-use alloy_primitives::{Address, B256, keccak256};
+use alloy_primitives::{Address, B256, Bytes, keccak256};
 use auto_impl::auto_impl;
 use core::error::Error;
 
@@ -35,18 +31,14 @@ pub trait Database: NonStaticAny {
     /// Loads bytecode by code hash.
     fn get_code_by_hash(&mut self, code_hash: &B256) -> Result<Bytecode, Self::Error>;
 
-    /// Loads one original payload. Providers classify legacy rows versus multi-chunk indices.
-    /// Never reconstruct full multi-chunk code to satisfy this operation.
-    fn get_code_chunk_by_hash(
-        &mut self,
-        code_hash: &B256,
-        index: u32,
-    ) -> Result<Option<CodeChunk>, Self::Error>;
+    /// Loads a stored prepared buffer by its chunk hash, including its padding and trailer.
+    /// The account metadata supplies the logical index and size. Never reconstruct full code.
+    fn get_code_chunk_by_hash(&mut self, chunk_hash: &B256) -> Result<Option<Bytes>, Self::Error>;
 
     /// Discards a raw response rejected by contextual execution validation.
     /// Cache adapters must evict and forward this notification to their backing adapter.
-    fn discard_code_chunk(&mut self, code_hash: &B256, index: u32) {
-        let _ = (code_hash, index);
+    fn discard_code_chunk(&mut self, chunk_hash: &B256) {
+        let _ = chunk_hash;
     }
 
     /// Loads a persistent storage slot.
@@ -99,16 +91,12 @@ impl<T: Database> Db<T> {
 }
 
 impl<T: Database> DynDatabase for Db<T> {
-    fn discard_code_chunk(&mut self, code_hash: &B256, index: u32) {
-        self.db.discard_code_chunk(code_hash, index);
+    fn discard_code_chunk(&mut self, chunk_hash: &B256) {
+        self.db.discard_code_chunk(chunk_hash);
     }
 
-    fn get_code_chunk_by_hash(
-        &mut self,
-        code_hash: &B256,
-        index: u32,
-    ) -> DbResult<Option<CodeChunk>> {
-        self.db.get_code_chunk_by_hash(code_hash, index).map_err(|err| {
+    fn get_code_chunk_by_hash(&mut self, chunk_hash: &B256) -> DbResult<Option<Bytes>> {
+        self.db.get_code_chunk_by_hash(chunk_hash).map_err(|err| {
             let fatal = T::is_fatal(&err);
             DatabaseError::new(err, fatal)
         })
@@ -155,17 +143,13 @@ pub trait DynDatabase: NonStaticAny {
     /// Loads bytecode by code hash.
     fn get_code_by_hash(&mut self, code_hash: &B256) -> DbResult<Bytecode>;
 
-    /// Loads one original payload without full-code reconstruction.
-    fn get_code_chunk_by_hash(
-        &mut self,
-        code_hash: &B256,
-        index: u32,
-    ) -> DbResult<Option<CodeChunk>>;
+    /// Loads a stored prepared buffer by its chunk hash, without full-code reconstruction.
+    fn get_code_chunk_by_hash(&mut self, chunk_hash: &B256) -> DbResult<Option<Bytes>>;
 
     /// Discards a raw response rejected by contextual execution validation.
     /// Cache adapters must evict and forward this notification to their backing adapter.
-    fn discard_code_chunk(&mut self, code_hash: &B256, index: u32) {
-        let _ = (code_hash, index);
+    fn discard_code_chunk(&mut self, chunk_hash: &B256) {
+        let _ = chunk_hash;
     }
 
     /// Loads a persistent storage slot.
@@ -282,17 +266,13 @@ impl<D> DbStats<D> {
 }
 
 impl<D: DynDatabase> DynDatabase for DbStats<D> {
-    fn discard_code_chunk(&mut self, code_hash: &B256, index: u32) {
-        self.db.discard_code_chunk(code_hash, index);
+    fn discard_code_chunk(&mut self, chunk_hash: &B256) {
+        self.db.discard_code_chunk(chunk_hash);
     }
 
-    fn get_code_chunk_by_hash(
-        &mut self,
-        code_hash: &B256,
-        index: u32,
-    ) -> DbResult<Option<CodeChunk>> {
+    fn get_code_chunk_by_hash(&mut self, chunk_hash: &B256) -> DbResult<Option<Bytes>> {
         self.counts.get_code_chunk_by_hash += 1;
-        self.db.get_code_chunk_by_hash(code_hash, index)
+        self.db.get_code_chunk_by_hash(chunk_hash)
     }
 
     #[inline]
@@ -345,12 +325,8 @@ pub(crate) fn boxed_dyn_database<'a>(database: impl DynDatabase + 'a) -> Box<dyn
 pub struct EmptyDB(());
 
 impl Database for EmptyDB {
-    fn get_code_chunk_by_hash(
-        &mut self,
-        code_hash: &B256,
-        index: u32,
-    ) -> Result<Option<CodeChunk>, Self::Error> {
-        let _ = (code_hash, index);
+    fn get_code_chunk_by_hash(&mut self, chunk_hash: &B256) -> Result<Option<Bytes>, Self::Error> {
+        let _ = chunk_hash;
         Ok(None)
     }
 
@@ -377,12 +353,8 @@ impl Database for EmptyDB {
 }
 
 impl DynDatabase for EmptyDB {
-    fn get_code_chunk_by_hash(
-        &mut self,
-        code_hash: &B256,
-        index: u32,
-    ) -> DbResult<Option<CodeChunk>> {
-        let _ = (code_hash, index);
+    fn get_code_chunk_by_hash(&mut self, chunk_hash: &B256) -> DbResult<Option<Bytes>> {
+        let _ = chunk_hash;
         Ok(None)
     }
 
@@ -415,12 +387,8 @@ mod tests {
     }
 
     impl DynDatabase for BorrowingDb<'_> {
-        fn get_code_chunk_by_hash(
-            &mut self,
-            code_hash: &B256,
-            index: u32,
-        ) -> DbResult<Option<CodeChunk>> {
-            let _ = (code_hash, index);
+        fn get_code_chunk_by_hash(&mut self, chunk_hash: &B256) -> DbResult<Option<Bytes>> {
+            let _ = chunk_hash;
             Ok(None)
         }
 

@@ -3,7 +3,7 @@ use crate::{
     bytecode::{Bytecode, code_chunk},
     constants::CALL_DEPTH_LIMIT,
     env::{BlockEnv, BlockEnvExt, TxEnv, TxEnvExt},
-    evm::{AccountLoad, CodeChunkLoad, SLoad, SStore, SelfDestructResult},
+    evm::{AccountLoad, SLoad, SStore, SelfDestructResult},
     interpreter::{
         Gas, GasTracker, Host, InstrStop, Interpreter, Memory, Message, MessageExt, MessageKind,
         MessageResult, MessageResultExt, StackBacking, Word, op,
@@ -139,13 +139,8 @@ impl Host<TestTypes> for TestHost {
         &mut self,
         _: &Address,
         index: u32,
-        skip: bool,
-    ) -> Result<Option<CodeChunkLoad>, crate::HostError> {
-        if skip && self.is_cold {
-            return Err(InstrStop::OutOfGas.into());
-        }
-        Ok(code_chunk(&self.code, index)
-            .map(|chunk| CodeChunkLoad { chunk, is_cold: self.is_cold }))
+    ) -> Result<Option<crate::bytecode::CodeChunk>, crate::HostError> {
+        Ok(code_chunk(&self.code, index))
     }
 
     fn code_chunk_is_warm(&self, _: &Address, _: u32) -> bool {
@@ -365,8 +360,7 @@ impl Default for RunConfig<'_> {
 
 pub(crate) fn run(config: RunConfig<'_>) -> TestInterpreter {
     let RunConfig { code, host, spec_id, tx_env, message, gas_limit, return_data } = config;
-    let message =
-        Message::<TestTypes> { code_chunk: legacy_bytecode(code).into(), gas_limit, ..message };
+    let message = Message::<TestTypes> { code: legacy_bytecode(code).into(), gas_limit, ..message };
     let mut inner = Interpreter::<TestTypes>::new(&tx_env, &message);
     *inner.return_data_mut() = return_data;
     let mut default_host = TestHost::default();

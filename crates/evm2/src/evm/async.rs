@@ -6,11 +6,11 @@
 
 use crate::{
     DatabaseError,
-    bytecode::{Bytecode, CodeChunk},
+    bytecode::Bytecode,
     evm::{AccountInfo, DbResult, DynDatabase, NonStaticAny},
     interpreter::Word,
 };
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, Bytes};
 use core::{fmt, future::Future, marker::PhantomData, pin::Pin, ptr::NonNull, task::Poll};
 use corosensei::{Coroutine, CoroutineResult, Yielder, stack::DefaultStack};
 use std::{cell::Cell, error::Error, io, task::Context};
@@ -423,16 +423,15 @@ pub trait AsyncDatabase: NonStaticAny {
         code_hash: B256,
     ) -> impl Future<Output = Result<Bytecode, Self::Error>> + Send + '_;
 
-    /// Loads a payload directly, preserving its known bytecode kind when available.
+    /// Loads a stored prepared buffer by its chunk hash, including its padding and trailer.
     fn get_code_chunk_by_hash(
         &mut self,
-        code_hash: B256,
-        index: u32,
-    ) -> impl Future<Output = Result<Option<CodeChunk>, Self::Error>> + Send + '_;
+        chunk_hash: B256,
+    ) -> impl Future<Output = Result<Option<Bytes>, Self::Error>> + Send + '_;
 
     /// Invalidates a rejected raw response in any provider-local cache.
-    fn discard_code_chunk(&mut self, code_hash: B256, index: u32) {
-        let _ = (code_hash, index);
+    fn discard_code_chunk(&mut self, chunk_hash: B256) {
+        let _ = chunk_hash;
     }
 
     /// Loads a persistent storage slot.
@@ -492,16 +491,12 @@ impl<D: AsyncDatabase> AsyncDb<D> {
 }
 
 impl<D: AsyncDatabase> DynDatabase for AsyncDb<D> {
-    fn discard_code_chunk(&mut self, code_hash: &B256, index: u32) {
-        self.db.discard_code_chunk(*code_hash, index);
+    fn discard_code_chunk(&mut self, chunk_hash: &B256) {
+        self.db.discard_code_chunk(*chunk_hash);
     }
 
-    fn get_code_chunk_by_hash(
-        &mut self,
-        code_hash: &B256,
-        index: u32,
-    ) -> DbResult<Option<CodeChunk>> {
-        let result = block_on_current_result(self.db.get_code_chunk_by_hash(*code_hash, index));
+    fn get_code_chunk_by_hash(&mut self, chunk_hash: &B256) -> DbResult<Option<Bytes>> {
+        let result = block_on_current_result(self.db.get_code_chunk_by_hash(*chunk_hash));
         self.database_result(result)
     }
 
@@ -1069,14 +1064,10 @@ mod tests {
 
         fn get_code_chunk_by_hash(
             &mut self,
-            code_hash: &B256,
-            index: u32,
-        ) -> Result<Option<crate::bytecode::CodeChunk>, Self::Error> {
-            if index != 0 {
-                return Ok(None);
-            }
-            let code = self.get_code_by_hash(code_hash)?;
-            Ok((!code.is_empty()).then(|| crate::bytecode::CodeChunk::from_bytecode(&code)))
+            chunk_hash: &B256,
+        ) -> Result<Option<Bytes>, Self::Error> {
+            let _ = chunk_hash;
+            Ok(None)
         }
 
         fn get_code_by_hash(&mut self, _code_hash: &B256) -> Result<Bytecode, Self::Error> {
@@ -1113,14 +1104,10 @@ mod tests {
 
         fn get_code_chunk_by_hash(
             &mut self,
-            code_hash: &B256,
-            index: u32,
-        ) -> Result<Option<crate::bytecode::CodeChunk>, Self::Error> {
-            if index != 0 {
-                return Ok(None);
-            }
-            let code = self.get_code_by_hash(code_hash)?;
-            Ok((!code.is_empty()).then(|| crate::bytecode::CodeChunk::from_bytecode(&code)))
+            chunk_hash: &B256,
+        ) -> Result<Option<Bytes>, Self::Error> {
+            let _ = chunk_hash;
+            Ok(None)
         }
 
         fn get_code_by_hash(&mut self, _code_hash: &B256) -> Result<Bytecode, Self::Error> {
@@ -1225,14 +1212,10 @@ mod tests {
 
         async fn get_code_chunk_by_hash(
             &mut self,
-            code_hash: B256,
-            index: u32,
-        ) -> Result<Option<crate::bytecode::CodeChunk>, Self::Error> {
-            if index != 0 {
-                return Ok(None);
-            }
-            let code = self.get_code_by_hash(code_hash).await?;
-            Ok((!code.is_empty()).then(|| crate::bytecode::CodeChunk::from_bytecode(&code)))
+            chunk_hash: B256,
+        ) -> Result<Option<Bytes>, Self::Error> {
+            let _ = chunk_hash;
+            Ok(None)
         }
 
         async fn get_code_by_hash(&mut self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
@@ -1268,14 +1251,10 @@ mod tests {
 
         async fn get_code_chunk_by_hash(
             &mut self,
-            code_hash: B256,
-            index: u32,
-        ) -> Result<Option<crate::bytecode::CodeChunk>, Self::Error> {
-            if index != 0 {
-                return Ok(None);
-            }
-            let code = self.get_code_by_hash(code_hash).await?;
-            Ok((!code.is_empty()).then(|| crate::bytecode::CodeChunk::from_bytecode(&code)))
+            chunk_hash: B256,
+        ) -> Result<Option<Bytes>, Self::Error> {
+            let _ = chunk_hash;
+            Ok(None)
         }
 
         async fn get_code_by_hash(&mut self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
@@ -1316,14 +1295,10 @@ mod tests {
 
         async fn get_code_chunk_by_hash(
             &mut self,
-            code_hash: B256,
-            index: u32,
-        ) -> Result<Option<crate::bytecode::CodeChunk>, Self::Error> {
-            if index != 0 {
-                return Ok(None);
-            }
-            let code = self.get_code_by_hash(code_hash).await?;
-            Ok((!code.is_empty()).then(|| crate::bytecode::CodeChunk::from_bytecode(&code)))
+            chunk_hash: B256,
+        ) -> Result<Option<Bytes>, Self::Error> {
+            let _ = chunk_hash;
+            Ok(None)
         }
 
         async fn get_code_by_hash(&mut self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
@@ -1375,14 +1350,10 @@ mod tests {
 
         async fn get_code_chunk_by_hash(
             &mut self,
-            code_hash: B256,
-            index: u32,
-        ) -> Result<Option<crate::bytecode::CodeChunk>, Self::Error> {
-            if index != 0 {
-                return Ok(None);
-            }
-            let code = self.get_code_by_hash(code_hash).await?;
-            Ok((!code.is_empty()).then(|| crate::bytecode::CodeChunk::from_bytecode(&code)))
+            chunk_hash: B256,
+        ) -> Result<Option<Bytes>, Self::Error> {
+            let _ = chunk_hash;
+            Ok(None)
         }
 
         async fn get_code_by_hash(&mut self, _code_hash: B256) -> Result<Bytecode, Self::Error> {

@@ -4,7 +4,7 @@ use super::*;
 use crate::{
     BaseEvmConfigSelector, BaseEvmTypes, Precompiles, SpecId, Version,
     bytecode::{
-        Bytecode, CODE_CHUNK_SIZE, COLD_CODE_CHUNK_GAS, CodeChunk, LEGACY_CODE_CHUNK_SIZE,
+        Bytecode, CODE_CHUNK_SIZE, COLD_CODE_CHUNK_GAS, LEGACY_CODE_CHUNK_SIZE,
         WARM_CODE_CHUNK_GAS, code_metadata,
     },
     env::{BlockEnvExt, TxEnvExt},
@@ -21,7 +21,8 @@ const CALLER: Address = Address::with_last_byte(0x82);
 #[derive(Default)]
 struct CodeReads {
     db: InMemoryDB,
-    reads: Vec<(B256, Option<u32>)>,
+    reads: Vec<CodeRead>,
+    chunk_error: Option<DatabaseError>,
 }
 
 impl DynDatabase for CodeReads {
@@ -30,13 +31,16 @@ impl DynDatabase for CodeReads {
     }
 
     fn get_code_by_hash(&mut self, hash: &B256) -> DbResult<Bytecode> {
-        self.reads.push((*hash, None));
+        self.reads.push(CodeRead::Legacy(*hash));
         DynDatabase::get_code_by_hash(&mut self.db, hash)
     }
 
-    fn get_code_chunk_by_hash(&mut self, hash: &B256, index: u32) -> DbResult<Option<CodeChunk>> {
-        self.reads.push((*hash, Some(index)));
-        DynDatabase::get_code_chunk_by_hash(&mut self.db, hash, index)
+    fn get_code_chunk_by_hash(&mut self, hash: &B256) -> DbResult<Option<Bytes>> {
+        self.reads.push(CodeRead::Chunk(*hash));
+        if let Some(error) = &self.chunk_error {
+            return Err(error.clone());
+        }
+        DynDatabase::get_code_chunk_by_hash(&mut self.db, hash)
     }
 
     fn get_storage(&mut self, address: &Address, key: &Word) -> DbResult<Word> {
@@ -47,8 +51,8 @@ impl DynDatabase for CodeReads {
         DynDatabase::get_block_hash(&mut self.db, number)
     }
 
-    fn discard_code_chunk(&mut self, hash: &B256, index: u32) {
-        DynDatabase::discard_code_chunk(&mut self.db, hash, index);
+    fn discard_code_chunk(&mut self, hash: &B256) {
+        DynDatabase::discard_code_chunk(&mut self.db, hash);
     }
 }
 
@@ -74,14 +78,14 @@ fn execute(evm: &mut Evm<'_, BaseEvmTypes>, code: Vec<u8>, gas_limit: u64) -> Me
     let mut message = MessageExt {
         destination: CALLER,
         code_address: CALLER,
-        code_chunk: CodeChunk::new(code.into()),
+        code: Bytecode::new_legacy(code.into()).into(),
         gas_limit,
         ..Default::default()
     };
     Host::execute_message(evm, &TxEnvExt::default(), &mut message).unwrap()
 }
 
-fn reads<'a>(evm: &'a Evm<'static, BaseEvmTypes>) -> &'a [(B256, Option<u32>)] {
+fn reads<'a>(evm: &'a Evm<'static, BaseEvmTypes>) -> &'a [CodeRead] {
     &evm.database().downcast_ref::<CodeReads>().unwrap().reads
 }
 
@@ -125,10 +129,7 @@ fn extcodecopy_reads_only_intersecting_payloads() {
         let copied = data.len().min(len);
         expected[..copied].copy_from_slice(&data[..copied]);
         assert_eq!(result.output.as_ref(), expected);
-        assert_eq!(
-            reads(&evm),
-            indices.iter().map(|&i| (keccak256(&bytes), Some(i))).collect::<Vec<_>>()
-        );
+        assert_eq!(reads(&evm), indices.iter().map(|&i| chunk_read(&bytes, i)).collect::<Vec<_>>());
         assert!(evm.state.account(&OWNER).unwrap().is_warm());
         for i in 0..3 {
             assert_eq!(Host::code_chunk_is_warm(&evm, &OWNER, i), indices.contains(&i));
@@ -194,7 +195,7 @@ fn legacy_external_code_uses_fixed_limit_after_size_is_known() {
         let result = execute(&mut evm, code, 100_000);
         assert_eq!(result.stop, InstrStop::Return);
         assert_eq!(result.output.as_ref(), [if size == 3 { 0 } else { op::JUMPDEST }, 0]);
-        assert_eq!(reads(&evm), [(keccak256(&bytes), None)]);
+        assert_eq!(reads(&evm), [CodeRead::Legacy(keccak256(&bytes))]);
         assert!(Host::code_chunk_is_warm(&evm, &OWNER, 0));
     }
 }
@@ -294,7 +295,7 @@ fn call_family_codecopy_uses_code_owner_and_global_offsets() {
             assert_eq!(&result.output[..32], Word::from(target + 1).to_be_bytes::<32>());
             assert_eq!(&result.output[32..64], Word::from(bytes.len()).to_be_bytes::<32>());
             assert_eq!(&result.output[64..], [1, 2, 3, 4]);
-            assert_eq!(reads(&evm), [0, 2, 1].map(|index| (keccak256(&bytes), Some(index))));
+            assert_eq!(reads(&evm), [0, 2, 1].map(|index| chunk_read(&bytes, index)));
         }
     }
 }
@@ -310,7 +311,7 @@ fn initcode_extcodecopy_reads_external_account_source() {
     let mut message = MessageExt {
         destination: CALLER,
         code_address: CALLER,
-        code_source: Some(CodeSource::Initcode(Bytes::from(initcode))),
+        code: CodeSource::Initcode(Bytes::from(initcode)),
         gas_limit: 100_000,
         ..Default::default()
     };
@@ -318,21 +319,18 @@ fn initcode_extcodecopy_reads_external_account_source() {
     assert_eq!(result.stop, InstrStop::Return);
     assert_eq!(&result.output[..7], [op::JUMPDEST; 7]);
     assert_eq!(&result.output[7..], [0; 9]);
-    assert_eq!(reads(&evm), [(keccak256(&bytes), Some(1))]);
+    assert_eq!(reads(&evm), [chunk_read(&bytes, 1)]);
 }
 
 fn execute_account(
     evm: &mut Evm<'_, BaseEvmTypes>,
-    size: usize,
     gas_limit: u64,
 ) -> Result<MessageResult, ExecutionError> {
-    let entry = Host::load_code_chunk(evm, &OWNER, 0, false).unwrap().unwrap().chunk;
+    let entry = Host::load_code_chunk(evm, &OWNER, 0).unwrap().unwrap();
     let mut message = MessageExt {
         destination: OWNER,
         code_address: OWNER,
-        code_chunk: entry,
-        code_source: Some(CodeSource::Account),
-        code_size: size,
+        code: CodeSource::Account(entry),
         gas_limit,
         ..Default::default()
     };
@@ -369,12 +367,12 @@ fn account_jumps_load_only_taken_target_chunks() {
             bytes[start..start + branch.len()].copy_from_slice(&branch);
             bytes[target] = op::JUMPDEST;
             let mut evm = test_evm(&bytes, true);
-            let result = execute_account(&mut evm, bytes.len(), 100_000).unwrap();
+            let result = execute_account(&mut evm, 100_000).unwrap();
             assert_eq!(result.stop, InstrStop::Stop);
             let indices = if taken { vec![0, 1] } else { vec![0] };
             assert_eq!(
                 reads(&evm),
-                indices.into_iter().map(|i| (keccak256(&bytes), Some(i))).collect::<Vec<_>>()
+                indices.into_iter().map(|i| chunk_read(&bytes, i)).collect::<Vec<_>>()
             );
         }
     }
@@ -395,11 +393,11 @@ fn account_fallthrough_skips_continued_push_data() {
     return_memory(&mut tail, 64);
     bytes[CODE_CHUNK_SIZE + 32..CODE_CHUNK_SIZE + 32 + tail.len()].copy_from_slice(&tail);
     let mut evm = test_evm(&bytes, true);
-    let result = execute_account(&mut evm, bytes.len(), 100_000).unwrap();
+    let result = execute_account(&mut evm, 100_000).unwrap();
     assert_eq!(result.stop, InstrStop::Return);
     assert_eq!(&result.output[..32], [op::INVALID; 32]);
     assert_eq!(&result.output[32..], Word::from(CODE_CHUNK_SIZE + 34).to_be_bytes::<32>());
-    assert_eq!(reads(&evm), [0, 1].map(|i| (keccak256(&bytes), Some(i))));
+    assert_eq!(reads(&evm), [0, 1].map(|i| chunk_read(&bytes, i)));
 }
 
 #[test]
@@ -410,27 +408,27 @@ fn account_codecopy_reserves_full_range_before_loading() {
     entry.push(op::CODECOPY);
     bytes[..entry.len()].copy_from_slice(&entry);
     let mut evm = test_evm(&bytes, true);
-    let result = execute_account(&mut evm, bytes.len(), COLD_CODE_CHUNK_GAS + 10_000).unwrap();
+    let result = execute_account(&mut evm, COLD_CODE_CHUNK_GAS + 10_000).unwrap();
     assert_eq!(result.stop, InstrStop::OutOfGas);
-    assert_eq!(reads(&evm), [(keccak256(&bytes), Some(0))]);
+    assert_eq!(reads(&evm), [chunk_read(&bytes, 0)]);
 }
 
 #[test]
 fn extcodecopy_missing_or_malformed_chunk_is_fatal() {
     let bytes = vec![op::STOP; CODE_CHUNK_SIZE + 7];
-    let hash = keccak256(&bytes);
     for malformed in [false, true] {
         let mut evm = test_evm(&bytes, true);
+        let chunk_hash = code_metadata(&bytes).unwrap().unwrap().chunk_hashes()[1];
         let db = evm.database_mut().downcast_mut::<CodeReads>().unwrap();
         if malformed {
-            db.db.cache.code_chunks.insert((hash, 1), CodeChunk::new(vec![op::STOP; 7].into()));
+            db.db.cache.code_chunks.insert(chunk_hash, vec![op::STOP; 7].into());
         } else {
-            db.db.cache.code_chunks.remove(&(hash, 1));
+            db.db.cache.code_chunks.remove(&chunk_hash);
         }
         let mut code = Vec::new();
         extcopy(&mut code, OWNER, Word::from(CODE_CHUNK_SIZE), 7);
         let mut message = MessageExt {
-            code_chunk: CodeChunk::new(code.into()),
+            code: Bytecode::new_legacy(code.into()).into(),
             gas_limit: 100_000,
             ..Default::default()
         };
@@ -438,10 +436,120 @@ fn extcodecopy_missing_or_malformed_chunk_is_fatal() {
             Host::execute_message(&mut evm, &TxEnvExt::default(), &mut message).unwrap_err();
         let ExecutionError::Database(error) = error else { panic!("expected database failure") };
         assert!(error.is_fatal());
-        let chunk_error = error.downcast_ref::<crate::CodeChunkError>().unwrap();
-        assert_eq!(chunk_error.code_hash, hash);
-        assert_eq!(chunk_error.index, 1);
-        assert_eq!(chunk_error.expected_length, Some(7));
-        assert_eq!(reads(&evm), [(hash, Some(1))]);
+        assert_eq!(
+            error.downcast_ref::<crate::CodeChunkLoadError>(),
+            Some(&if malformed {
+                crate::CodeChunkLoadError::Invalid(chunk_hash)
+            } else {
+                crate::CodeChunkLoadError::Missing(chunk_hash)
+            })
+        );
+        assert_eq!(reads(&evm), [chunk_read(&bytes, 1)]);
+        // Rejected raw bytes must be evicted from every cache so a repaired provider can retry.
+        let db = evm.database_mut().downcast_mut::<CodeReads>().unwrap();
+        assert!(!db.db.cache.code_chunks.contains_key(&chunk_hash));
+        let chunk = crate::bytecode::code_chunk(&Bytes::copy_from_slice(&bytes), 1).unwrap();
+        db.db.cache.code_chunks.insert(chunk_hash, chunk.as_bytecode().original_bytes());
+        let result = Host::execute_message(&mut evm, &TxEnvExt::default(), &mut message).unwrap();
+        assert_eq!(result.stop, InstrStop::Stop);
+        assert_eq!(reads(&evm), [chunk_read(&bytes, 1), chunk_read(&bytes, 1)]);
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("chunk provider failure")]
+struct ChunkProviderFailure;
+
+#[test]
+fn extcodecopy_provider_failure_preserves_original_error_and_is_fatal() {
+    let bytes = vec![op::STOP; CODE_CHUNK_SIZE + 7];
+    for fatal in [false, true] {
+        let mut evm = test_evm(&bytes, true);
+        let db = evm.database_mut().downcast_mut::<CodeReads>().unwrap();
+        db.chunk_error = Some(DatabaseError::new(ChunkProviderFailure, fatal));
+        let mut code = Vec::new();
+        extcopy(&mut code, OWNER, Word::from(CODE_CHUNK_SIZE), 7);
+        let mut message = MessageExt {
+            code: Bytecode::new_legacy(code.into()).into(),
+            gas_limit: 100_000,
+            ..Default::default()
+        };
+        let error =
+            Host::execute_message(&mut evm, &TxEnvExt::default(), &mut message).unwrap_err();
+        let ExecutionError::Database(error) = error else { panic!("expected database failure") };
+        assert!(error.is_fatal());
+        assert!(error.downcast_ref::<ChunkProviderFailure>().is_some());
+        assert_eq!(reads(&evm), [chunk_read(&bytes, 1)]);
+    }
+}
+
+#[test]
+fn invalid_inline_delegation_is_fatal() {
+    for target in [Address::ZERO, OWNER] {
+        let mut account = AccountInfo::default().with_code(Bytecode::new_eip7702(target));
+        if target == OWNER {
+            account.code_hash = B256::ZERO;
+        }
+        let error = account.inline_delegation_code().unwrap_err();
+        assert!(error.is_fatal());
+        assert_eq!(
+            error.downcast_ref::<crate::CodeChunkLoadError>(),
+            Some(&crate::CodeChunkLoadError::InvalidDelegation(account.code_hash))
+        );
+    }
+}
+
+/// The backing store sees content hashes, never account addresses or logical indices.
+#[derive(Debug, PartialEq, Eq)]
+enum CodeRead {
+    Legacy(B256),
+    Chunk(B256),
+}
+
+fn chunk_read(code: &[u8], index: u32) -> CodeRead {
+    CodeRead::Chunk(code_metadata(code).unwrap().unwrap().chunk_hashes()[index as usize])
+}
+
+#[test]
+fn identical_chunk_hashes_share_bytes_but_not_warmth() {
+    let mut bytes = vec![op::STOP; 2 * CODE_CHUNK_SIZE + 1];
+    assert_eq!(chunk_read(&bytes, 0), chunk_read(&bytes, 1));
+    let mut evm = test_evm(&bytes, true);
+    let mut code = Vec::new();
+    extcopy(&mut code, OWNER, Word::ZERO, 1);
+    extcopy(&mut code, OWNER, Word::from(CODE_CHUNK_SIZE), 1);
+    let shared = execute(&mut evm, code.clone(), 100_000);
+    assert_eq!(shared.stop, InstrStop::Stop);
+    assert_eq!(reads(&evm), [chunk_read(&bytes, 0)]);
+    assert!(Host::code_chunk_is_warm(&evm, &OWNER, 0));
+    assert!(Host::code_chunk_is_warm(&evm, &OWNER, 1));
+
+    let other = Address::with_last_byte(0x84);
+    let account = evm
+        .database()
+        .downcast_ref::<CodeReads>()
+        .unwrap()
+        .db
+        .account_info(&OWNER)
+        .unwrap()
+        .clone();
+    evm.overlay_db_mut().insert_account_info(&other, account);
+    assert!(!Host::code_chunk_is_warm(&evm, &other, 0));
+    let mut other_copy = Vec::new();
+    extcopy(&mut other_copy, other, Word::ZERO, 1);
+    let other_result = execute(&mut evm, other_copy, 100_000);
+    assert_eq!(other_result.stop, InstrStop::Stop);
+    assert_eq!(reads(&evm), [chunk_read(&bytes, 0)]);
+    assert!(Host::code_chunk_is_warm(&evm, &other, 0));
+    assert!(!Host::code_chunk_is_warm(&evm, &other, 1));
+    let mut cold_copy = Vec::new();
+    extcopy(&mut cold_copy, OWNER, Word::ZERO, 1);
+    let cold_result = execute(&mut test_evm(&bytes, true), cold_copy, 100_000);
+    assert_eq!(other_result.gas.remaining(), cold_result.gas.remaining());
+
+    bytes[CODE_CHUNK_SIZE] = op::JUMPDEST;
+    let mut separate = test_evm(&bytes, true);
+    let distinct = execute(&mut separate, code, 100_000);
+    assert_eq!(reads(&separate), [chunk_read(&bytes, 0), chunk_read(&bytes, 1)]);
+    assert_eq!(shared.gas.remaining(), distinct.gas.remaining());
 }

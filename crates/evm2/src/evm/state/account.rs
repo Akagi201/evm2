@@ -5,7 +5,7 @@ use super::{
     StateInner, StorageChange, StorageHandle, StorageOverlay, storage_pool::StoragePool,
 };
 use crate::{
-    CodeChunkError, DatabaseError, EvmFeatures,
+    CodeChunkLoadError, DatabaseError, EvmFeatures,
     bytecode::{Bytecode, CodeMetadata},
     interpreter::Word,
 };
@@ -828,14 +828,7 @@ impl AccountInfo {
         let code = Bytecode::new_eip7702(target);
         if target.is_zero() || code.hash_slow() != self.code_hash {
             return Err(DatabaseError::new(
-                CodeChunkError {
-                    code_hash: self.code_hash,
-                    index: 0,
-                    expected_length: Some(23),
-                    actual_length: None,
-                    reason: "invalid inline delegation metadata",
-                    source: None,
-                },
+                CodeChunkLoadError::InvalidDelegation(self.code_hash),
                 true,
             ));
         }

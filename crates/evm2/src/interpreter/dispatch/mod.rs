@@ -24,7 +24,7 @@ pub(in crate::interpreter) use imp::run;
 fn run_state<'a, 'frame, 'host, T: EvmTypesHost>(
     interpreter: &'a mut Interpreter<'frame, 'host, T>,
 ) -> (&'a mut InterpreterState<'frame, 'host, T>, Pc, RawStack<'a>) {
-    let pc = Pc::new(interpreter.pc);
+    let pc = Pc::new(interpreter.code.pc);
     let stack = RawStack::new(&raw mut *interpreter.stack, interpreter.stack_len);
     // SAFETY: Only the active interpreter lifetime is erased; this stays as a raw pointer so
     // the dispatch loop does not create an extra `&mut` alias for `interpreter`.

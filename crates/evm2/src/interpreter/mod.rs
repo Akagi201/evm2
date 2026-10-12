@@ -41,6 +41,8 @@ mod runtime;
 pub(crate) use runtime::InterpreterPool;
 pub use runtime::{Interpreter, InterpreterState};
 
+mod code;
+
 /// Instruction result type.
 pub type Result<T = (), E = InstrStop> = core::result::Result<T, E>;
 

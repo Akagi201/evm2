@@ -2,7 +2,7 @@
 
 use crate::{
     EvmFeatures, EvmTypesHost,
-    bytecode::{Bytecode, CodeChunk},
+    bytecode::Bytecode,
     constants::CALL_DEPTH_LIMIT,
     interpreter::{
         CodeSource, Gas, Host, InstrStop, InterpreterState, Message, MessageExt, MessageKind,
@@ -152,7 +152,6 @@ fn load_acc_and_calc_gas<T: EvmTypesHost>(
     gas.spend(cost)?;
     gas.spend_state(new_account_state_gas)?;
     let mut code_chunk = None;
-    let mut code_size = code.len();
     if draft
         && (!native || disable_precompiles)
         && account.code_hash != B256::ZERO
@@ -161,12 +160,11 @@ fn load_acc_and_calc_gas<T: EvmTypesHost>(
         if let Some(target) = account.inline_delegation {
             // A delegation target is not followed recursively; synthesize its own marker.
             code = Bytecode::new_eip7702(target);
-            code_size = code.len();
         } else {
             let tariff = state.chunk_tariff(&code_address, 0);
             gas.spend(tariff)?;
             let chunk = state.required_code_chunk(&code_address, 0)?;
-            code_size = account.code_size.map_or(chunk.payload_len(), |size| size as usize);
+
             code_chunk = Some(chunk);
         }
     }
@@ -186,9 +184,7 @@ fn load_acc_and_calc_gas<T: EvmTypesHost>(
         gas_limit,
         new_account_state_gas,
         LoadedCode {
-            code_source: code_chunk.as_ref().map(|_| CodeSource::Account),
-            code_chunk: code_chunk.unwrap_or_else(|| code.into()),
-            code_size,
+            code: code_chunk.map_or_else(|| code.into(), CodeSource::Account),
             code_hash: account.code_hash,
             code_address,
             disable_precompiles,
@@ -260,9 +256,7 @@ fn prepare_call<T: EvmTypesHost>(
         caller,
         input,
         value: call_value,
-        code_chunk: loaded.code_chunk,
-        code_source: loaded.code_source,
-        code_size: loaded.code_size,
+        code: loaded.code,
         code_hash: loaded.code_hash,
         code_address,
         disable_precompiles: loaded.disable_precompiles,
@@ -436,15 +430,11 @@ fn create_inner<T: EvmTypesHost>(
         destination,
         call_target: destination,
         caller,
-        code_chunk: if state.feature(EvmFeatures::TIP1143) {
-            Default::default()
+        code: if state.feature(EvmFeatures::TIP1143) {
+            CodeSource::Initcode(input.clone())
         } else {
             Bytecode::new_legacy(input.clone()).into()
         },
-        code_source: state
-            .feature(EvmFeatures::TIP1143)
-            .then(|| CodeSource::Initcode(input.clone())),
-        code_size: input.len(),
         code_hash: B256::ZERO,
         input,
         value,
@@ -513,9 +503,7 @@ pub fn selfdestruct(cx: _, [target]: [Word]) -> Result {
 
 /// Resolved entry code, retaining logical identity separately from the execution buffer.
 struct LoadedCode {
-    code_chunk: CodeChunk,
-    code_source: Option<CodeSource>,
-    code_size: usize,
+    code: CodeSource,
     code_hash: B256,
     code_address: Address,
     disable_precompiles: bool,

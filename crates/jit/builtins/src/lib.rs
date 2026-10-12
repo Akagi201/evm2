@@ -735,10 +735,9 @@ pub unsafe extern "C" fn __revmc_builtin_create(
         destination,
         call_target: destination,
         caller,
-        code_size: code.len(),
+
         code_hash: B256::ZERO,
-        code_source: None,
-        code_chunk: (Bytecode::new_legacy(code.clone())).into(),
+                code: (Bytecode::new_legacy(code.clone())).into(),
         input: code,
         value,
         code_address: caller,
@@ -848,10 +847,9 @@ pub unsafe extern "C" fn __revmc_builtin_call(
         caller,
         input,
         value: call_value,
-        code_size: loaded_code.len(),
+
         code_hash: loaded_code.hash_slow(),
-        code_source: None,
-        code_chunk: (loaded_code).into(),
+                code: (loaded_code).into(),
         code_address,
         disable_precompiles,
         caller_is_static: ecx.is_static(),
@@ -1177,7 +1175,7 @@ mod tests {
         let message = MessageExt {
             gas_limit: 1_000_000,
             destination: caller,
-            code_chunk: (Bytecode::new_legacy(Bytes::from_static(&[op::STOP]))).into(),
+            code: (Bytecode::new_legacy(Bytes::from_static(&[op::STOP]))).into(),
             ..MessageExt::default()
         };
         let mut interpreter =
@@ -1232,7 +1230,7 @@ mod tests {
             destination,
             caller,
             value: Word::from(0x99),
-            code_chunk: (Bytecode::new_legacy(Bytes::from_static(&[op::STOP]))).into(),
+            code: (Bytecode::new_legacy(Bytes::from_static(&[op::STOP]))).into(),
             ..MessageExt::default()
         };
         let mut interpreter =
@@ -1272,7 +1270,7 @@ mod tests {
             destination,
             caller,
             value: current_value,
-            code_chunk: (Bytecode::new_legacy(Bytes::from_static(&[op::STOP]))).into(),
+            code: (Bytecode::new_legacy(Bytes::from_static(&[op::STOP]))).into(),
             ..MessageExt::default()
         };
         let mut interpreter =
@@ -1311,7 +1309,7 @@ mod tests {
             destination,
             caller,
             value: Word::from(0x99),
-            code_chunk: (Bytecode::new_legacy(Bytes::from_static(&[op::STOP]))).into(),
+            code: (Bytecode::new_legacy(Bytes::from_static(&[op::STOP]))).into(),
             ..MessageExt::default()
         };
         let mut interpreter =
@@ -1354,7 +1352,7 @@ mod tests {
         let tx_env = TxEnvExt::default();
         let message = MessageExt {
             gas_limit: 1_000_000,
-            code_chunk: (Bytecode::new_legacy(Bytes::from_static(&[op::STOP]))).into(),
+            code: (Bytecode::new_legacy(Bytes::from_static(&[op::STOP]))).into(),
             ..MessageExt::default()
         };
         let mut interpreter =
@@ -1399,7 +1397,7 @@ mod tests {
         let tx_env = TxEnvExt::default();
         let message = MessageExt {
             gas_limit: 1_000_000,
-            code_chunk: (Bytecode::new_legacy(Bytes::from_static(&[op::STOP]))).into(),
+            code: (Bytecode::new_legacy(Bytes::from_static(&[op::STOP]))).into(),
             ..MessageExt::default()
         };
         let mut interpreter =
@@ -1455,7 +1453,7 @@ mod tests {
                     depth,
                     gas_limit: 100_000,
                     destination: contract,
-                    code_chunk: (Bytecode::new_legacy(Bytes::from_static(&[op::STOP]))).into(),
+                    code: (Bytecode::new_legacy(Bytes::from_static(&[op::STOP]))).into(),
                     ..MessageExt::default()
                 };
                 let mut interpreter =

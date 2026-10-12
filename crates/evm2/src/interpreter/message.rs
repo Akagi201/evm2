@@ -1,4 +1,7 @@
-use crate::{BaseEvmTypes, EvmTypesHost, bytecode::CodeChunk};
+use crate::{
+    BaseEvmTypes, EvmTypesHost,
+    bytecode::{Bytecode, CodeChunk},
+};
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 
 /// EVM message kind.
@@ -65,14 +68,9 @@ pub struct MessageExt<E = ()> {
     pub input: Bytes,
     /// Value transferred with the message.
     pub value: U256,
-    /// Entry account or resident code, including its cached analysis.
-    /// Initcode sources prepare their own entry buffer; this field is unused for them.
-    pub code_chunk: CodeChunk,
-    /// Source of lazily loaded code. `None` executes the resident `code_chunk`.
-    pub code_source: Option<CodeSource>,
-    /// Global logical size for account code. Initcode carries its own original bytes.
-    pub code_size: usize,
-    /// Global code identity, used for contextual provider errors.
+    /// Complete bytecode for direct execution, an account's entry chunk, or creation input.
+    pub code: CodeSource,
+    /// Global code identity used by inspectors and compiled execution.
     pub code_hash: B256,
     /// Address whose code is being executed. This can differ from `destination` for `CALLCODE`,
     /// `DELEGATECALL`, and EIP-7702 delegated-code execution.
@@ -111,9 +109,7 @@ impl<E> MessageExt<E> {
             caller,
             input,
             value,
-            code_chunk,
-            code_source,
-            code_size,
+            code,
             code_hash,
             code_address,
             disable_precompiles,
@@ -132,9 +128,7 @@ impl<E> MessageExt<E> {
             caller,
             input,
             value,
-            code_chunk,
-            code_source,
-            code_size,
+            code,
             code_hash,
             code_address,
             disable_precompiles,
@@ -165,11 +159,36 @@ pub fn derive_create_destination(
     }
 }
 
-/// Source of code loaded during execution, independent of the active execution buffer.
+/// Code supplied to a frame. Each source carries exactly the data needed to execute it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CodeSource {
+    /// Complete bytecode executed directly as one buffer, without chunk loading.
+    Direct(Bytecode),
     /// Immutable transaction input or a snapshot of a CREATE/CREATE2 memory range.
     Initcode(Bytes),
-    /// Account code loaded through the host, with account chunk warmth and tariffs.
-    Account,
+    /// Entry chunk of account code. Further chunks use the frame's code address and host.
+    Account(CodeChunk),
+}
+
+impl Default for CodeSource {
+    fn default() -> Self {
+        Self::Direct(Bytecode::default())
+    }
+}
+
+impl From<Bytecode> for CodeSource {
+    fn from(code: Bytecode) -> Self {
+        Self::Direct(code)
+    }
+}
+
+impl CodeSource {
+    /// Original creation input or stored entry bytes, without ordinary memory safety padding.
+    pub fn bytes(&self) -> Bytes {
+        match self {
+            Self::Initcode(bytes) => bytes.clone(),
+            Self::Direct(code) => code.original_bytes(),
+            Self::Account(chunk) => chunk.as_bytecode().original_bytes(),
+        }
+    }
 }

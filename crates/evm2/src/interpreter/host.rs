@@ -3,7 +3,7 @@ use crate::{
     BaseEvmTypes, DatabaseError, EvmFeatures, EvmTypesHost, ExecutionConfig, ExecutionError,
     HostError, SpecId,
     env::{BlockEnv, TxEnv},
-    evm::{AccountLoad, CodeChunkLoad, SLoad, SStore, SelfDestructResult},
+    evm::{AccountLoad, SLoad, SStore, SelfDestructResult},
 };
 use alloy_primitives::{Address, B256, Bytes, Log};
 
@@ -139,8 +139,7 @@ pub trait Host<T: EvmTypesHost> {
         &mut self,
         address: &Address,
         index: u32,
-        skip_cold_load: bool,
-    ) -> Result<Option<CodeChunkLoad>, HostError>;
+    ) -> Result<Option<crate::bytecode::CodeChunk>, HostError>;
 
     /// Reads logical transaction warmth without fetching code.
     fn code_chunk_is_warm(&self, address: &Address, index: u32) -> bool;

@@ -104,7 +104,7 @@ mod tests {
         let tx_env = TxEnvExt::default();
         let message = MessageExt {
             gas_limit: 10_000,
-            code_chunk: (legacy_bytecode(code)).into(),
+            code: (legacy_bytecode(code)).into(),
             ..MessageExt::default()
         };
         let mut interp = Interpreter::<TestTypes>::new(&tx_env, &message);
@@ -129,7 +129,7 @@ mod tests {
         let tx_env = TxEnvExt::default();
         let message = MessageExt {
             gas_limit: 17,
-            code_chunk: (legacy_bytecode(code)).into(),
+            code: (legacy_bytecode(code)).into(),
             ..MessageExt::default()
         };
         let mut interp = Interpreter::<TestTypes>::new(&tx_env, &message);

@@ -1,12 +1,9 @@
 use super::{
     BytecodeRef, CodeSource, Gas, Host, InstrStop, Memory, Message, MessageKind, Pc, Result,
-    StackBacking, StackMut, StackRef, Word,
+    StackBacking, StackMut, StackRef, Word, code::InterpreterCode,
 };
 use crate::{
     EvmTypesHost, ExecutionConfig, ExecutionError, HostError, SpecId, Version,
-    bytecode::{
-        Bytecode, CODE_CHUNK_SIZE, COLD_CODE_CHUNK_GAS, CodeChunk, Initcode, WARM_CODE_CHUNK_GAS,
-    },
     env::TxEnv,
     evm::inspector::Inspector,
     interpreter::dispatch,
@@ -21,14 +18,10 @@ use derive_where::derive_where;
 /// EVM interpreter.
 #[derive_where(Debug)]
 pub struct Interpreter<'frame, 'host, T: EvmTypesHost> {
-    pub(in crate::interpreter) bytecode: Bytecode,
-    // Borrows the immutable allocations owned by `bytecode`. Cleared before replacing it;
-    // accessors must shorten the erased lifetime to the borrow of this interpreter.
-    bytecode_ref: Option<BytecodeRef<'static>>,
+    pub(in crate::interpreter) code: InterpreterCode,
     pub(in crate::interpreter) memory: Memory,
     pub(in crate::interpreter) return_data: Bytes,
 
-    pub(in crate::interpreter) pc: *const u8,
     output: Range<u32>,
     #[derive_where(skip)]
     tx_env: Option<&'frame TxEnv<T>>,
@@ -46,15 +39,10 @@ pub struct Interpreter<'frame, 'host, T: EvmTypesHost> {
     spec: SpecId,
     features: EvmFeatures,
     is_static: bool,
-    code_chunk: Option<CodeChunk>,
-    code_chunk_index: u32,
-    code_size: usize,
     inspecting_internal_tail: bool,
-    chunk_tail_offset: Option<usize>,
-    initcode: Option<Initcode>,
 }
 
-// SAFETY: The interpreter's internal pointers are always valid. `pc` and `bytecode_ref` point into
+// SAFETY: The interpreter's internal pointers are always valid. Its code cursor points into
 // immutable owned bytecode and its jump table. Frame-local references are cleared before pooling,
 // and host/inspector pointers are installed for
 // execution and not used after the owning execution context is gone. The `Sync` bounds make the
@@ -81,11 +69,8 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     ///
     /// Must call `init` before use.
     unsafe fn uninit() -> Self {
-        let bytecode = Bytecode::new();
         Self {
-            pc: bytecode.original_byte_slice().as_ptr(),
-            bytecode,
-            bytecode_ref: None,
+            code: InterpreterCode::default(),
             stack_len: 0,
             gas: Gas::new(0),
             memory: Memory::new(),
@@ -95,12 +80,7 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
             tx_env: None,
             message: None,
             is_static: false,
-            code_chunk: None,
-            code_chunk_index: 0,
-            code_size: 0,
             inspecting_internal_tail: false,
-            chunk_tail_offset: None,
-            initcode: None,
             return_data: Bytes::new(),
             host: None,
             inspector: None,
@@ -113,33 +93,9 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
 
     /// Initializes this interpreter for a new frame, retaining reusable allocations.
     fn init(&mut self, tx_env: &'frame TxEnv<T>, message: &'frame Message<T>) {
-        self.initcode = None;
-        let (chunk, chunked, code_size) = match &message.code_source {
-            Some(CodeSource::Initcode(bytes)) if bytes.len() > CODE_CHUNK_SIZE => {
-                let initcode = self.initcode.insert(Initcode::new(bytes.clone()));
-                (initcode.chunk(0).expect("nonempty initcode"), true, bytes.len())
-            }
-            Some(CodeSource::Initcode(bytes)) => {
-                (CodeChunk::new(bytes.clone()), false, bytes.len())
-            }
-            source => (
-                message.code_chunk.clone(),
-                matches!(source, Some(CodeSource::Account)),
-                message.code_size,
-            ),
-        };
-        let bytecode = chunk.bytecode();
-        self.chunk_tail_offset = (chunked && self.initcode.is_none())
-            .then(|| chunk.prepared().map(|p| p.tail_offset()))
-            .flatten();
+        self.code = InterpreterCode::new(&message.code);
         let gas_limit = message.gas_limit;
         let is_static = message.caller_is_static || matches!(message.kind, MessageKind::StaticCall);
-        self.pc = bytecode.bytes_slice().as_ptr();
-        self.bytecode_ref = None;
-        self.bytecode = bytecode;
-        self.code_chunk = chunked.then_some(chunk);
-        self.code_chunk_index = 0;
-        self.code_size = if self.code_chunk.is_some() { code_size } else { self.bytecode.len() };
         self.inspecting_internal_tail = false;
         self.stack_len = 0;
         self.gas = Gas::new_with_execution_gas_and_reservoir(gas_limit, message.reservoir);
@@ -157,7 +113,7 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
         self.tx_env = None;
         self.message = None;
         self.host = None;
-        self.initcode = None;
+        self.code = InterpreterCode::default();
         self.inspector = None;
     }
 
@@ -188,9 +144,7 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     /// Returns the current logical global program counter.
     #[inline]
     pub fn pc(&self) -> usize {
-        // SAFETY: `pc` is always in bounds of `bytecode`.
-        (unsafe { self.pc.offset_from(self.bytecode.bytes_slice().as_ptr()) as usize })
-            + self.code_chunk_index as usize * CODE_CHUNK_SIZE
+        self.code.pc()
     }
 
     /// Sets a logical global program counter within the active chunk.
@@ -200,54 +154,43 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     /// Panics if `pc` is out of bounds of the active bytecode.
     #[inline]
     pub fn set_pc(&mut self, pc: usize) {
-        let pc = pc
-            .checked_sub(self.code_chunk_index as usize * CODE_CHUNK_SIZE)
-            .expect("PC is outside the active chunk");
-        if let Some(chunk) = self.code_chunk.clone().filter(|c| c.prepared().is_some()) {
-            assert!(pc < chunk.payload_len(), "PC is outside the logical payload");
-            self.activate_chunk(self.code_chunk_index, chunk);
-        }
-        let bytecode = self.bytecode.bytes_slice();
-        assert!(pc < bytecode.len());
-        self.pc = unsafe { bytecode.as_ptr().add(pc) };
+        self.code.set_pc(pc);
     }
 
     /// Returns the current opcode.
     #[inline]
     pub const fn opcode(&self) -> u8 {
         // SAFETY: `pc` is always in bounds of `bytecode`.
-        unsafe { *self.pc }
+        unsafe { *self.code.pc }
     }
 
     /// Returns the active bytecode.
     #[inline]
     pub fn bytecode(&self) -> BytecodeRef<'_> {
-        self.bytecode_ref.unwrap_or_else(|| BytecodeRef::new(&self.bytecode))
+        self.code.view()
     }
 
     /// Returns the stored active chunk bytes, excluding ordinary safety padding.
     #[inline]
     pub fn original_bytecode(&self) -> Bytes {
-        self.bytecode.original_bytes()
+        self.code.active().as_bytecode().original_bytes()
     }
 
     /// Returns the stored active chunk bytes as a slice, excluding safety padding.
     #[inline]
     pub fn original_bytecode_slice(&self) -> &[u8] {
-        self.bytecode.original_byte_slice()
+        self.code.active().as_bytecode().original_byte_slice()
     }
 
     /// Calculates or returns the cached hash of the original active bytecode.
     #[inline]
     pub fn original_bytecode_hash(&self) -> B256 {
-        if let Some(CodeSource::Initcode(bytes)) =
-            self.message.and_then(|message| message.code_source.as_ref())
-        {
+        if let Some(CodeSource::Initcode(bytes)) = self.message.map(|message| &message.code) {
             alloy_primitives::keccak256(bytes)
-        } else if self.code_chunk.is_some() {
+        } else if self.code.is_account() {
             self.message.expect("initialized frame").code_hash
         } else {
-            self.bytecode.hash_slow()
+            self.code.active().as_bytecode().hash_slow()
         }
     }
 
@@ -453,13 +396,7 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     #[inline]
     #[doc(hidden)]
     pub fn prepare_run(&mut self, host: &mut T::Host<'host>) {
-        if self.bytecode_ref.is_none() {
-            // SAFETY: The view borrows immutable allocations retained by our owned `Bytecode`,
-            // so moving the interpreter does not invalidate it. `init` clears the view before
-            // replacing the owner, and accessors tie the returned view to `&self`.
-            let bytecode = unsafe { trustme::decouple_lt(&self.bytecode) };
-            self.bytecode_ref = Some(BytecodeRef::new(bytecode));
-        }
+        self.code.prepare();
         let config = host.execution_config();
         let version = config.version();
         self.memory.set_memory_limit(version.memory_limit);
@@ -555,7 +492,7 @@ impl<'frame, 'host, T: EvmTypesHost> InterpreterState<'frame, 'host, T> {
 
     #[inline]
     pub(crate) const fn set_pc_stack_len(&mut self, pc: *const u8, stack_len: usize) {
-        self.0.pc = pc;
+        self.0.code.pc = pc;
         self.0.stack_len = stack_len;
     }
 
@@ -578,7 +515,7 @@ impl<'frame, 'host, T: EvmTypesHost> InterpreterState<'frame, 'host, T> {
     pub const fn bytecode(&self) -> BytecodeRef<'_> {
         // SAFETY: `prepare_run` initializes the view before instruction execution. It remains
         // valid across call/resume cycles and is only cleared when initializing a new frame.
-        unsafe { self.0.bytecode_ref.unwrap_unchecked() }
+        self.0.code.prepared_view()
     }
 
     /// Returns the host implementation.
@@ -684,10 +621,9 @@ impl<'frame, 'host, T: EvmTypesHost> InterpreterState<'frame, 'host, T> {
 
     #[inline]
     pub(crate) fn inspect_step(&mut self, pc: Pc, stack_len: usize) {
-        self.0.pc = pc.as_ptr();
+        self.0.code.pc = pc.as_ptr();
         self.0.stack_len = stack_len;
-        self.0.inspecting_internal_tail = self.0.chunk_tail_offset.is_some()
-            && self.bytecode().pc_offset(pc) >= self.active_chunk().payload_len();
+        self.0.inspecting_internal_tail = self.0.code.is_internal(pc);
         if self.0.inspecting_internal_tail {
             return;
         }
@@ -703,7 +639,7 @@ impl<'frame, 'host, T: EvmTypesHost> InterpreterState<'frame, 'host, T> {
             self.0.inspecting_internal_tail = false;
             return;
         }
-        self.0.pc = pc.as_ptr();
+        self.0.code.pc = pc.as_ptr();
         self.0.stack_len = stack_len;
         if self.0.result.is_err_and(InstrStop::is_out_of_gas) {
             cold_path();
@@ -827,320 +763,5 @@ mod bytecode_padding_tests {
         let interp = run(RunConfig::new([op::PUSH1, 3, op::JUMP, op::JUMPDEST]));
         assert_eq!(interp.err, InstrStop::Stop);
         assert!(interp.stack().is_empty());
-    }
-}
-
-impl<T: EvmTypesHost> InterpreterState<'_, '_, T> {
-    /// Whether this frame executes through chunked bytecode buffers.
-    pub const fn is_chunked_code(&self) -> bool {
-        self.0.code_chunk.is_some()
-    }
-
-    /// Complete logical code size, excluding execution padding.
-    pub const fn code_size(&self) -> usize {
-        self.0.code_size
-    }
-
-    /// Active payload index in the logical contract.
-    pub const fn code_chunk_index(&self) -> u32 {
-        self.0.code_chunk_index
-    }
-
-    /// Original global offset of the active instruction.
-    pub const fn global_pc(&self, pc: Pc) -> usize {
-        self.bytecode().pc_offset(pc) + self.0.code_chunk_index as usize * CODE_CHUNK_SIZE
-    }
-
-    /// Authenticates the generated tail by its recorded offset, never by opcode alone.
-    pub(crate) fn is_generated_tail(&self, pc: Pc) -> bool {
-        self.0.chunk_tail_offset.is_some_and(|tail| self.bytecode().pc_offset(pc) == tail)
-    }
-
-    /// Validates against the complete logical jump map before choosing an execution view.
-    pub(crate) const fn active_chunk(&self) -> &CodeChunk {
-        self.0.code_chunk.as_ref().expect("runtime chunk")
-    }
-
-    /// Tariff based only on logical warmth, before any payload fetch.
-    pub(crate) fn chunk_tariff(&mut self, address: &Address, index: u32) -> u64 {
-        if self.host().code_chunk_is_warm(address, index) {
-            WARM_CODE_CHUNK_GAS
-        } else {
-            COLD_CODE_CHUNK_GAS
-        }
-    }
-
-    /// Loads a required payload after the caller has reserved gas.
-    pub(crate) fn required_code_chunk(
-        &mut self,
-        address: &Address,
-        index: u32,
-    ) -> Result<CodeChunk> {
-        self.host()
-            .load_code_chunk(address, index, false)
-            .map_err(|error| self.fail(error))?
-            .map(|loaded| loaded.chunk)
-            .ok_or_else(|| {
-                self.fail(crate::DatabaseError::new(
-                    MissingRuntimeChunk { address: *address, index },
-                    true,
-                ))
-            })
-    }
-
-    /// Replaces the owner before rebuilding its borrowed view. Callers reset their PC next.
-    pub(crate) fn activate_code_chunk(&mut self, index: u32, chunk: CodeChunk) {
-        self.0.activate_chunk(index, chunk);
-    }
-
-    /// Loads an execution chunk from frame-local initcode or the account host.
-    pub(crate) fn execution_code_chunk(&mut self, gas: &mut Gas, index: u32) -> Result<CodeChunk> {
-        if let Some(initcode) = &mut self.0.initcode {
-            return Ok(initcode.chunk(index).expect("validated initcode index"));
-        }
-        let address = self.message().code_address;
-        gas.spend(self.chunk_tariff(&address, index))?;
-        self.required_code_chunk(&address, index)
-    }
-
-    /// Switches initcode buffers between instructions without executing or charging padding.
-    #[inline]
-    pub(crate) fn advance_initcode_pc(&mut self, pc: &mut Pc) {
-        if self.0.initcode.is_none() {
-            return;
-        }
-        let local = self.bytecode().pc_offset(*pc);
-        if local < self.active_chunk().payload_len() {
-            return;
-        }
-        let next_pc = self.global_pc(*pc);
-        if next_pc >= self.code_size() {
-            return;
-        }
-        let index = (next_pc / CODE_CHUNK_SIZE) as u32;
-        let chunk = self.0.initcode.as_mut().unwrap().chunk(index).expect("in-range initcode");
-        self.activate_code_chunk(index, chunk);
-        unsafe { pc.set_unchecked(self.bytecode(), next_pc % CODE_CHUNK_SIZE) };
-    }
-}
-
-/// A required payload unexpectedly absent from a custom host implementation.
-#[derive(Debug, thiserror::Error)]
-#[error("missing required runtime chunk {index} for {address}")]
-struct MissingRuntimeChunk {
-    address: Address,
-    index: u32,
-}
-
-impl<T: EvmTypesHost> Interpreter<'_, '_, T> {
-    /// Activates the single prepared bytecode and rebuilds its borrowed view.
-    fn activate_chunk(&mut self, index: u32, chunk: CodeChunk) {
-        self.chunk_tail_offset =
-            self.initcode.is_none().then(|| chunk.prepared().map(|p| p.tail_offset())).flatten();
-        self.bytecode_ref = None;
-        self.bytecode = chunk.bytecode();
-        self.code_chunk = Some(chunk);
-        self.code_chunk_index = index;
-        // SAFETY: The immutable allocation remains owned by this interpreter until the next
-        // activation. All view accessors shorten this erased lifetime to their borrow.
-        let bytecode = unsafe { trustme::decouple_lt(&self.bytecode) };
-        self.bytecode_ref = Some(BytecodeRef::new(bytecode));
-        self.pc = self.bytecode.bytes_slice().as_ptr();
-    }
-}
-
-#[cfg(test)]
-mod initcode_tests {
-    use super::*;
-    use crate::{
-        BaseEvmConfigSelector,
-        bytecode::MAX_INITCODE_SIZE,
-        env::TxEnvExt,
-        interpreter::{MessageExt, instructions::encode_rjump_offset, op},
-        test_utils::{TestHost, TestTypes},
-    };
-    use alloc::vec;
-
-    fn compare_initcode(code: Vec<u8>, expected: InstrStop) {
-        let bytes = Bytes::from(code);
-        let tx = TxEnvExt::default();
-        let resident = MessageExt {
-            gas_limit: 10_000_000,
-            code_chunk: CodeChunk::new(bytes.clone()),
-            ..Default::default()
-        };
-        let chunked = MessageExt {
-            code_chunk: CodeChunk::default(),
-            code_source: Some(CodeSource::Initcode(bytes)),
-            ..resident.clone()
-        };
-        let mut host = TestHost {
-            execution_config: ExecutionConfig::for_base_spec::<BaseEvmConfigSelector>(
-                SpecId::OSAKA,
-            )
-            .with_version(Version::base(SpecId::OSAKA).with_tip1143(true)),
-            ..Default::default()
-        };
-        let mut resident = Interpreter::<TestTypes>::new(&tx, &resident);
-        let mut chunked = Interpreter::<TestTypes>::new(&tx, &chunked);
-        assert_eq!(resident.run(&mut host).unwrap(), expected);
-        assert_eq!(chunked.run(&mut host).unwrap(), expected);
-        assert_eq!(chunked.gas().remaining(), resident.gas().remaining());
-        assert_eq!(chunked.stack().as_slice(), resident.stack().as_slice());
-        assert_eq!(chunked.memory().as_slice(), resident.memory().as_slice());
-        assert_eq!(chunked.output(), resident.output());
-    }
-
-    #[test]
-    fn initcode_fallthrough_preserves_pc_and_gas() {
-        let mut code = vec![op::JUMPDEST; CODE_CHUNK_SIZE + 1];
-        code.extend([op::PC, op::GAS, op::CODESIZE, op::STOP]);
-        compare_initcode(code, InstrStop::Stop);
-    }
-
-    #[test]
-    fn initcode_crossing_push_and_truncated_immediates() {
-        for continuation in 1..=32 {
-            let mut code = vec![op::JUMPDEST; CODE_CHUNK_SIZE - (33 - continuation)];
-            code.push(op::PUSH32);
-            code.extend([op::JUMPDEST; 32]);
-            code.extend([op::PC, op::GAS, op::STOP]);
-            compare_initcode(code, InstrStop::Stop);
-        }
-        let mut code = vec![op::JUMPDEST; CODE_CHUNK_SIZE - 1];
-        code.extend([op::PUSH32, 0x12]);
-        compare_initcode(code, InstrStop::Stop);
-    }
-
-    #[test]
-    fn initcode_jumps_forward_and_back() {
-        let target = 3 * CODE_CHUNK_SIZE;
-        let mut code = vec![op::STOP; target + 7];
-        code[..10].copy_from_slice(&[
-            op::PUSH3,
-            (target >> 16) as u8,
-            (target >> 8) as u8,
-            target as u8,
-            op::JUMP,
-            op::JUMPDEST,
-            op::PC,
-            op::GAS,
-            op::STOP,
-            op::STOP,
-        ]);
-        code[target..].copy_from_slice(&[
-            op::JUMPDEST,
-            op::PC,
-            op::PUSH1,
-            5,
-            op::JUMP,
-            op::INVALID,
-            op::STOP,
-        ]);
-        compare_initcode(code, InstrStop::Stop);
-    }
-
-    #[test]
-    fn initcode_rejects_jump_into_continued_push() {
-        let target = CODE_CHUNK_SIZE;
-        let mut code = vec![op::STOP; target + 33];
-        code[..4].copy_from_slice(&[op::PUSH2, (target >> 8) as u8, target as u8, op::JUMP]);
-        code[target - 1] = op::PUSH32;
-        code[target] = op::JUMPDEST;
-        compare_initcode(code, InstrStop::InvalidJump);
-    }
-
-    #[test]
-    fn initcode_untaken_jump_does_not_validate_destination() {
-        let mut code = vec![op::INVALID; MAX_INITCODE_SIZE];
-        code[..5].copy_from_slice(&[op::PUSH0, op::PUSH1, 99, op::JUMPI, op::STOP]);
-        compare_initcode(code, InstrStop::Stop);
-    }
-
-    #[test]
-    fn initcode_relative_jump_crosses_boundary() {
-        let mut code = vec![op::JUMPDEST; CODE_CHUNK_SIZE - 1];
-        code.push(op::RJUMP);
-        code.extend(encode_rjump_offset(1).unwrap());
-        code.extend([op::INVALID, op::JUMPDEST, op::PC, op::GAS, op::STOP]);
-        compare_initcode(code, InstrStop::Stop);
-    }
-
-    #[test]
-    fn initcode_codecopy_reads_original_bytes_and_zero_fills() {
-        for offset in [CODE_CHUNK_SIZE - 16, MAX_INITCODE_SIZE - 16, MAX_INITCODE_SIZE + 1] {
-            let mut code = vec![0xab; MAX_INITCODE_SIZE];
-            code[..13].copy_from_slice(&[
-                op::PUSH1,
-                64,
-                op::PUSH3,
-                (offset >> 16) as u8,
-                (offset >> 8) as u8,
-                offset as u8,
-                op::PUSH0,
-                op::CODECOPY,
-                op::PUSH1,
-                64,
-                op::PUSH0,
-                op::RETURN,
-                op::STOP,
-            ]);
-            compare_initcode(code, InstrStop::Return);
-        }
-    }
-
-    #[test]
-    fn initcode_preserves_legacy_jump_analysis_inside_invalid_relative_immediates() {
-        for (target, operand, expected) in [
-            (CODE_CHUNK_SIZE + 1, op::STOP, InstrStop::Stop),
-            (CODE_CHUNK_SIZE + 20, op::PUSH32, InstrStop::InvalidJump),
-        ] {
-            let mut code = vec![op::STOP; CODE_CHUNK_SIZE + 40];
-            code[..4].copy_from_slice(&[op::PUSH2, (target >> 8) as u8, target as u8, op::JUMP]);
-            code[CODE_CHUNK_SIZE - 1] = op::RJUMP;
-            code[CODE_CHUNK_SIZE] = operand;
-            code[target] = op::JUMPDEST;
-            compare_initcode(code, expected);
-        }
-    }
-
-    #[derive(Default)]
-    struct InitcodeTrace(Vec<(bool, usize, u64)>);
-
-    impl Inspector<TestTypes> for InitcodeTrace {
-        fn step(&mut self, interp: &mut Interpreter<'_, '_, TestTypes>) {
-            self.0.push((false, interp.pc(), interp.gas().remaining()));
-        }
-
-        fn step_end(&mut self, interp: &mut Interpreter<'_, '_, TestTypes>) {
-            self.0.push((true, interp.pc(), interp.gas().remaining()));
-        }
-    }
-
-    #[test]
-    fn initcode_inspector_trace_matches_resident_execution() {
-        let mut code = vec![op::JUMPDEST; CODE_CHUNK_SIZE - 1];
-        code.extend([op::PUSH2, 0x12, 0x34, op::PC, op::GAS, op::STOP]);
-        let bytes = Bytes::from(code);
-        let tx = TxEnvExt::default();
-        let resident = MessageExt {
-            gas_limit: 100_000,
-            code_chunk: CodeChunk::new(bytes.clone()),
-            ..Default::default()
-        };
-        let chunked = MessageExt {
-            code_chunk: CodeChunk::default(),
-            code_source: Some(CodeSource::Initcode(bytes)),
-            ..resident.clone()
-        };
-        let mut host = TestHost::default();
-        let mut expected = InitcodeTrace::default();
-        let mut actual = InitcodeTrace::default();
-        let mut resident = Interpreter::<TestTypes>::new(&tx, &resident);
-        let mut chunked = Interpreter::<TestTypes>::new(&tx, &chunked);
-        assert_eq!(chunked.original_bytecode_hash(), resident.original_bytecode_hash());
-        assert_eq!(resident.run_inspect(&mut host, &mut expected).unwrap(), InstrStop::Stop);
-        assert_eq!(chunked.run_inspect(&mut host, &mut actual).unwrap(), InstrStop::Stop);
-        assert_eq!(actual.0, expected.0);
     }
 }

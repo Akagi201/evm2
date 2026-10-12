@@ -45,9 +45,6 @@ pub struct Version {
     /// Maximum blobs allowed in a single blob transaction.
     pub max_blobs_per_tx: usize,
 
-    /// Limits restored when the draft is disabled again.
-    tip1143_previous_limits: Option<(usize, usize)>,
-
     #[doc(hidden)] // Not public API. Please use an existing constructor.
     pub _non_exhaustive: (),
 }
@@ -96,19 +93,9 @@ impl Version {
         }
     }
 
-    /// Enables or disables the unscheduled TIP-1143 draft, including its size ceilings.
-    /// Disabling restores the limits in effect before enabling; other fork settings survive.
+    /// Enables or disables the unscheduled TIP-1143 draft.
+    /// Configure [`Self::max_code_size`] and [`Self::max_initcode_size`] independently.
     pub const fn with_tip1143(mut self, enabled: bool) -> Self {
-        if enabled {
-            if self.tip1143_previous_limits.is_none() {
-                self.tip1143_previous_limits = Some((self.max_code_size, self.max_initcode_size));
-            }
-            self.max_code_size = crate::bytecode::MAX_CODE_SIZE;
-            self.max_initcode_size = crate::bytecode::MAX_INITCODE_SIZE;
-        } else if let Some((code, initcode)) = self.tip1143_previous_limits.take() {
-            self.max_code_size = code;
-            self.max_initcode_size = initcode;
-        }
         self.features.set(EvmFeatures::TIP1143, enabled);
         self
     }
@@ -150,7 +137,6 @@ static BASE_VERSIONS: [Version; SpecId::COUNT] = {
             max_code_size: MAX_CODE_SIZE,
             max_initcode_size: MAX_INITCODE_SIZE,
             max_blobs_per_tx: MAX_BLOBS_PER_BLOCK_DENCUN,
-            tip1143_previous_limits: None,
             _non_exhaustive: (),
         }
     }; SpecId::COUNT];
@@ -166,7 +152,6 @@ static BASE_VERSIONS: [Version; SpecId::COUNT] = {
             max_code_size: base_max_code_size(spec_id),
             max_initcode_size: base_max_initcode_size(spec_id),
             max_blobs_per_tx: base_max_blobs_per_tx(spec_id),
-            tip1143_previous_limits: None,
             _non_exhaustive: (),
         };
         i += 1;
