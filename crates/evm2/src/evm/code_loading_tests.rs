@@ -13,7 +13,7 @@ use crate::{
     test_utils::{push, push_address, push_all},
 };
 use alloc::{vec, vec::Vec};
-use alloy_primitives::{Bytes, TxKind, U256, keccak256};
+use alloy_primitives::{Bytes, TxKind, U256, hex, keccak256};
 
 const OWNER: Address = Address::with_last_byte(0x81);
 const CALLER: Address = Address::with_last_byte(0x82);
@@ -652,4 +652,67 @@ fn initial_chunk_skips_cold_read_and_accepts_warm_budget() {
             }
         }
     }
+}
+
+#[test]
+fn account_code_size_distinguishes_empty_unknown_and_chunked_without_loading() {
+    let mut evm = test_evm(&[op::STOP], false);
+    let funded = Address::with_last_byte(0x85);
+    evm.overlay_db_mut()
+        .insert_account_info(&funded, AccountInfo { balance: Word::from(1), ..Default::default() });
+    for address in [OWNER, funded, Address::with_last_byte(0x86)] {
+        let metadata = Host::load_account(&mut evm, &address, false, false).unwrap();
+        assert_eq!(metadata.code_size, if address == OWNER { None } else { Some(0) });
+        assert_eq!(metadata.is_empty, address != OWNER && address != funded);
+        assert!(metadata.code.is_empty());
+        assert!(reads(&evm).is_empty());
+    }
+    let loaded = Host::load_account(&mut evm, &OWNER, true, false).unwrap();
+    assert_eq!(loaded.code_size, Some(1));
+    assert_eq!(loaded.code.original_byte_slice(), &[op::STOP]);
+
+    let bytes = vec![op::STOP; 2 * CODE_CHUNK_SIZE + 7];
+    let mut evm = test_evm(&bytes, true);
+    let metadata = Host::load_account(&mut evm, &OWNER, false, false).unwrap();
+    assert!(metadata.is_chunked);
+    assert_eq!(metadata.code_size, Some(bytes.len() as u32));
+    assert!(metadata.code.is_empty());
+    assert!(reads(&evm).is_empty());
+}
+
+#[test]
+fn precompile_calls_skip_chunk_loading_and_tariffs() {
+    let sha256 = Address::with_last_byte(2);
+    let expected = hex!("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    for opcode in [op::CALL, op::CALLCODE, op::DELEGATECALL, op::STATICCALL] {
+        let mut evm = test_evm(&[op::STOP], false);
+        let mut code = Vec::new();
+        call(&mut code, opcode, sha256, 32);
+        return_memory(&mut code, 32);
+        let result = execute(&mut evm, code, 10_000);
+        assert_eq!(result.stop, InstrStop::Return);
+        assert_eq!(result.output.as_ref(), expected);
+        assert!(reads(&evm).is_empty());
+        assert!(!evm.state.code_chunk_is_warm(&sha256, 0));
+    }
+
+    let mut evm = test_evm(&[op::STOP], false);
+    let mut gas = GasTracker::new(10_000);
+    let mut frame = prepare_initial_frame(
+        &mut evm,
+        CALLER,
+        0,
+        TxKind::Call(sha256),
+        &Bytes::new(),
+        U256::ZERO,
+        &mut gas,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(gas.remaining(), 10_000);
+    let result = Host::execute_message(&mut evm, &TxEnvExt::default(), &mut frame.message).unwrap();
+    assert!(result.is_success());
+    assert_eq!(result.output.as_ref(), expected);
+    assert_eq!(result.gas.remaining(), 9_940);
+    assert!(reads(&evm).is_empty());
 }

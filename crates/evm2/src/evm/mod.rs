@@ -1554,7 +1554,7 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
         } else {
             Bytecode::default()
         };
-        let code_size = account.code_size();
+        let code_size = account.code_size().or_else(|| load_code.then_some(code.len() as u32));
         Ok(AccountLoad {
             code_size,
             is_chunked: info.code_metadata().is_some(),
@@ -1580,10 +1580,6 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
             let is_cold = chunk.warm();
             CodeChunkLoad { chunk: chunk.get().clone(), is_cold }
         }))
-    }
-
-    fn is_precompile(&self, address: &Address) -> bool {
-        self.precompiles.contains(address)
     }
 
     fn target_is_empty_for_new_account_gas(
@@ -1760,7 +1756,8 @@ pub struct AccountLoad {
     pub code_hash: B256,
     /// Account bytecode.
     pub code: Bytecode,
-    /// Original size, known without payload reads for typed accounts.
+    /// Original code size: `Some(0)` for empty code, known for chunked/delegated code,
+    /// and `None` only for nonempty legacy code whose size has not been loaded.
     pub code_size: Option<u32>,
     /// Whether original runtime is stored in prepared chunks.
     pub is_chunked: bool,

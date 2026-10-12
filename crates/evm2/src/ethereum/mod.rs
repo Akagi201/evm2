@@ -969,10 +969,8 @@ fn prepare_initial_chunked_frame<T: EvmTypes>(
     }
     let mut owner = to;
     let mut disable_precompiles = false;
-    let native = Host::is_precompile(host, &to);
 
-    if !native
-        && host.feature(EvmFeatures::EIP7702)
+    if host.feature(EvmFeatures::EIP7702)
         && let Some(target) = account.inline_delegation
     {
         let metered = host.feature(EvmFeatures::EIP2780);
@@ -995,10 +993,7 @@ fn prepare_initial_chunked_frame<T: EvmTypes>(
     }
     let mut code = Bytecode::default();
     let mut code_chunk = None;
-    if (!native || disable_precompiles)
-        && !account.code_hash.is_zero()
-        && account.code_hash != alloy_primitives::KECCAK256_EMPTY
-    {
+    if account.code_size != Some(0) {
         if let Some(target) = account.inline_delegation {
             code = Bytecode::new_eip7702(target);
         } else {

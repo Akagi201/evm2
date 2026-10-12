@@ -11,7 +11,7 @@ use crate::{
     utils::{word_to_address, word_to_usize},
     version::GasId,
 };
-use alloy_primitives::{Address, B256, Bytes, KECCAK256_EMPTY};
+use alloy_primitives::{Address, B256, Bytes};
 use core::{cmp::min, ops::Range};
 use evm2_macros::instruction;
 
@@ -99,15 +99,7 @@ fn load_acc_and_calc_gas<T: EvmTypesHost>(
     }
     let mut code = account.code.clone();
     let mut code_address = to;
-    let native = state.host().is_precompile(&to);
-
-    let delegation = if draft && native {
-        None
-    } else if draft {
-        account.inline_delegation
-    } else {
-        code.eip7702_address()
-    };
+    let delegation = if draft { account.inline_delegation } else { code.eip7702_address() };
     let mut disable_precompiles = false;
     if state.feature(EvmFeatures::EIP7702)
         && let Some(delegated_address) = delegation
@@ -152,11 +144,7 @@ fn load_acc_and_calc_gas<T: EvmTypesHost>(
     gas.spend(cost)?;
     gas.spend_state(new_account_state_gas)?;
     let mut code_chunk = None;
-    if draft
-        && (!native || disable_precompiles)
-        && account.code_hash != B256::ZERO
-        && account.code_hash != KECCAK256_EMPTY
-    {
+    if draft && account.code_size != Some(0) {
         if let Some(target) = account.inline_delegation {
             // A delegation target is not followed recursively; synthesize its own marker.
             code = Bytecode::new_eip7702(target);

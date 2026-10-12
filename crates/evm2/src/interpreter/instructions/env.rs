@@ -9,7 +9,7 @@ use crate::{
     version::GasParams,
 };
 use alloc::vec::Vec;
-use alloy_primitives::{B256, KECCAK256_EMPTY};
+use alloy_primitives::B256;
 use evm2_macros::instruction;
 
 fn load_account<T: EvmTypesHost>(
@@ -143,7 +143,7 @@ pub fn extcodesize(cx: _, [addr]: [Word]) -> Result<out> {
         account.code.len()
     } else if account.inline_delegation.is_some() {
         23
-    } else if account.code_hash.is_zero() || account.code_hash == KECCAK256_EMPTY {
+    } else if account.code_size == Some(0) {
         0
     } else if account.is_chunked {
         account.code_size.expect("chunked size") as usize
@@ -179,7 +179,7 @@ pub fn extcodecopy(cx: _, [addr, memory_offset, code_offset, len]: [Word]) -> Re
             let code = Bytecode::new_eip7702(target);
             let source = word_to_usize_saturated(*code_offset);
             code.original_byte_slice().get(source..).unwrap_or_default().to_vec()
-        } else if account.code_hash.is_zero() || account.code_hash == KECCAK256_EMPTY {
+        } else if account.code_size == Some(0) {
             Vec::new()
         } else {
             cx.state.load_code_range(

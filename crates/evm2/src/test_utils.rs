@@ -131,10 +131,6 @@ impl Host<TestTypes> for TestHost {
         })
     }
 
-    fn is_precompile(&self, _: &Address) -> bool {
-        false
-    }
-
     fn load_code_chunk(
         &mut self,
         _: &Address,

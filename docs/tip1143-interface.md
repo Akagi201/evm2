@@ -94,3 +94,5 @@ Reth/Tempo must authenticate ingestion, atomically persist prepared buffers by c
 
 
 `RJUMPI` (`0xe1`) uses the same two-byte offset encoding and costs 4 gas. It pops one condition: nonzero jumps through the shared RJUMP target loader, while zero advances past the immediate. An untaken branch does not validate, load, charge or warm its target chunk; ordinary fallthrough can still cross a chunk boundary and execute a generated RJUMP. Invalid immediate encodings fail even for an untaken branch. Both relative opcodes are unknown when TIP-1143 is disabled.
+
+`AccountLoad::code_size` reports `Some(0)` for empty code, `Some(size)` for chunked/delegated code or a previously loaded legacy record, and `None` for nonempty legacy code whose exact size is unknown. Chunk size comes from the extension’s hash count and last chunk size, without fetching payloads. Calls and external code reads skip chunk loading when `code_size == Some(0)`; an unknown size still requires loading. Precompiles have no stored bytecode; precompile dispatch remains in `Evm` and needs no separate interpreter host query.
