@@ -5,8 +5,8 @@ use crate::{
     bytecode::{Bytecode, CodeChunk},
     constants::CALL_DEPTH_LIMIT,
     interpreter::{
-        Gas, Host, InstrStop, InterpreterState, Message, MessageExt, MessageKind, Result, StackMut,
-        Word, derive_create_destination,
+        CodeSource, Gas, Host, InstrStop, InterpreterState, Message, MessageExt, MessageKind,
+        Result, StackMut, Word, derive_create_destination,
     },
     utils::{word_to_address, word_to_usize},
     version::GasId,
@@ -186,7 +186,7 @@ fn load_acc_and_calc_gas<T: EvmTypesHost>(
         gas_limit,
         new_account_state_gas,
         LoadedCode {
-            is_lazy_code: code_chunk.is_some(),
+            code_source: code_chunk.as_ref().map(|_| CodeSource::Account),
             code_chunk: code_chunk.unwrap_or_else(|| code.into()),
             code_size,
             code_hash: account.code_hash,
@@ -261,7 +261,7 @@ fn prepare_call<T: EvmTypesHost>(
         input,
         value: call_value,
         code_chunk: loaded.code_chunk,
-        is_lazy_code: loaded.is_lazy_code,
+        code_source: loaded.code_source,
         code_size: loaded.code_size,
         code_hash: loaded.code_hash,
         code_address,
@@ -436,8 +436,14 @@ fn create_inner<T: EvmTypesHost>(
         destination,
         call_target: destination,
         caller,
-        code_chunk: (Bytecode::new_legacy(input.clone())).into(),
-        is_lazy_code: false,
+        code_chunk: if state.feature(EvmFeatures::TIP1143) {
+            Default::default()
+        } else {
+            Bytecode::new_legacy(input.clone()).into()
+        },
+        code_source: state
+            .feature(EvmFeatures::TIP1143)
+            .then(|| CodeSource::Initcode(input.clone())),
         code_size: input.len(),
         code_hash: B256::ZERO,
         input,
@@ -508,7 +514,7 @@ pub fn selfdestruct(cx: _, [target]: [Word]) -> Result {
 /// Resolved entry code, retaining logical identity separately from the execution buffer.
 struct LoadedCode {
     code_chunk: CodeChunk,
-    is_lazy_code: bool,
+    code_source: Option<CodeSource>,
     code_size: usize,
     code_hash: B256,
     code_address: Address,

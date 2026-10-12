@@ -14,8 +14,8 @@ pub const LEGACY_CODE_CHUNK_SIZE: usize = 24 * 1024;
 pub const MAX_CODE_CHUNKS: usize = 40;
 /// Draft runtime byte limit.
 pub const MAX_CODE_SIZE: usize = CODE_CHUNK_SIZE * MAX_CODE_CHUNKS;
-/// Draft resident initcode byte limit.
-pub const MAX_INITCODE_SIZE: usize = 1_966_080;
+/// Draft initcode byte limit (2 MiB), independent of the runtime chunk count.
+pub const MAX_INITCODE_SIZE: usize = 2 * 1024 * 1024;
 /// Draft cold chunk tariff, pending production calibration.
 pub const COLD_CODE_CHUNK_GAS: u64 = 28_680;
 /// Draft warm chunk tariff.
@@ -172,25 +172,25 @@ impl CodeChunk {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(try_from = "MetadataFields"))]
 pub struct CodeMetadata {
-    code_size: u32,
+    last_chunk_size: u32,
     chunk_hashes: Vec<B256>,
 }
 
 impl CodeMetadata {
-    /// Validates the size and ordered hash count. Payload authentication belongs to ingestion.
-    pub fn new(code_size: u32, chunk_hashes: Vec<B256>) -> Result<Self, CodeChunkError> {
-        let size = usize::try_from(code_size).map_err(|_| CodeChunkError::InvalidMetadata)?;
-        if !(CODE_CHUNK_SIZE + 1..=MAX_CODE_SIZE).contains(&size)
-            || chunk_hashes.len() != size.div_ceil(CODE_CHUNK_SIZE)
+    /// Validates the last chunk size and ordered hash count.
+    /// Payload authentication belongs to ingestion.
+    pub fn new(last_chunk_size: u32, chunk_hashes: Vec<B256>) -> Result<Self, CodeChunkError> {
+        if !(1..=CODE_CHUNK_SIZE as u32).contains(&last_chunk_size)
+            || !(2..=MAX_CODE_CHUNKS).contains(&chunk_hashes.len())
         {
             return Err(CodeChunkError::InvalidMetadata);
         }
-        Ok(Self { code_size, chunk_hashes })
+        Ok(Self { last_chunk_size, chunk_hashes })
     }
 
     /// Committed original code length.
     pub const fn code_size(&self) -> u32 {
-        self.code_size
+        (self.chunk_hashes.len() as u32 - 1) * CODE_CHUNK_SIZE as u32 + self.last_chunk_size
     }
 
     /// Ordered commitments to complete stored chunk buffers, including the start-offset byte.
@@ -200,9 +200,19 @@ impl CodeMetadata {
 
     /// Exact payload length for an in-range index, without provider access.
     pub fn chunk_len(&self, index: u32) -> Option<usize> {
-        let start = usize::try_from(index).ok()?.checked_mul(CODE_CHUNK_SIZE)?;
-        let remaining = usize::try_from(self.code_size).ok()?.checked_sub(start)?;
-        (remaining != 0).then_some(remaining.min(CODE_CHUNK_SIZE))
+        let index = usize::try_from(index).ok()?;
+        (index < self.chunk_hashes.len()).then(|| {
+            if index == self.chunk_hashes.len() - 1 {
+                self.last_chunk_size as usize
+            } else {
+                CODE_CHUNK_SIZE
+            }
+        })
+    }
+
+    /// Committed original payload length of the last chunk.
+    pub const fn last_chunk_size(&self) -> u32 {
+        self.last_chunk_size
     }
 }
 
@@ -247,14 +257,14 @@ pub fn code_metadata(code: &[u8]) -> Result<Option<CodeMetadata>, CodeChunkError
     if code.len() <= CODE_CHUNK_SIZE {
         return Ok(None);
     }
-    let size = u32::try_from(code.len()).map_err(|_| CodeChunkError::CodeTooLarge)?;
+    let last_chunk_size = ((code.len() - 1) % CODE_CHUNK_SIZE + 1) as u32;
     let code = Bytes::copy_from_slice(code);
     let hashes = (0..code.len().div_ceil(CODE_CHUNK_SIZE))
         .map(|index| {
             code_chunk(&code, index as u32).expect("validated chunk index").bytecode.hash_slow()
         })
         .collect();
-    CodeMetadata::new(size, hashes).map(Some)
+    CodeMetadata::new(last_chunk_size, hashes).map(Some)
 }
 
 /// Prepares one chunk at creation or ingestion, without retaining its original slice.
@@ -302,7 +312,7 @@ pub const fn code_chunk_gas(cold: u64, warm: u64) -> Option<u64> {
 #[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
 struct MetadataFields {
-    code_size: u32,
+    last_chunk_size: u32,
     chunk_hashes: Vec<B256>,
 }
 
@@ -311,7 +321,7 @@ impl TryFrom<MetadataFields> for CodeMetadata {
     type Error = CodeChunkError;
 
     fn try_from(fields: MetadataFields) -> Result<Self, Self::Error> {
-        Self::new(fields.code_size, fields.chunk_hashes)
+        Self::new(fields.last_chunk_size, fields.chunk_hashes)
     }
 }
 
@@ -363,4 +373,148 @@ fn padding_suffix(continuation_len: usize) -> Vec<u8> {
         padding[remaining - 1] = op::JUMPDEST;
     }
     padding
+}
+
+/// Temporary initcode with one boundary scan and lazily prepared execution buffers.
+#[derive(Debug)]
+pub(crate) struct Initcode {
+    bytes: Bytes,
+    start_offsets: Vec<u8>,
+    chunks: Vec<Option<CodeChunk>>,
+}
+
+impl Initcode {
+    pub(crate) fn new(bytes: Bytes) -> Self {
+        let count = bytes.len().div_ceil(CODE_CHUNK_SIZE);
+        let mut start_offsets = Vec::with_capacity(count);
+        let mut pc = 0;
+        for start in (0..bytes.len()).step_by(CODE_CHUNK_SIZE) {
+            while pc < start {
+                let opcode = bytes[pc];
+                pc += if (op::PUSH1..=op::PUSH32).contains(&opcode) {
+                    usize::from(opcode - op::PUSH1) + 2
+                } else {
+                    1
+                };
+            }
+            start_offsets.push((pc.min(bytes.len()) - start) as u8);
+        }
+        Self { bytes, start_offsets, chunks: alloc::vec![None; count] }
+    }
+
+    pub(crate) fn chunk(&mut self, index: u32) -> Option<CodeChunk> {
+        let index = index as usize;
+        let cached = self.chunks.get_mut(index)?;
+        if let Some(chunk) = cached {
+            return Some(chunk.clone());
+        }
+        let start = index * CODE_CHUNK_SIZE;
+        let end = ((index + 1) * CODE_CHUNK_SIZE).min(self.bytes.len());
+        let start_offset = usize::from(self.start_offsets[index]);
+        // Original lookahead completes every possible immediate at the payload boundary.
+        // It is never executed: dispatch switches chunks before the next opcode.
+        let mut bytes = self.bytes[start..(end + 32).min(self.bytes.len())].to_vec();
+        bytes.resize(end - start + 33, op::STOP);
+        bytes.push(start_offset as u8);
+        let mut jumps = JumpTable::new(bytes.len());
+        let mut pc = start_offset;
+        while pc < end - start {
+            let opcode = bytes[pc];
+            if opcode == op::JUMPDEST {
+                jumps.as_mut_slice()[pc / 8] |= 1 << (pc % 8);
+            }
+            pc += if (op::PUSH1..=op::PUSH32).contains(&opcode) {
+                usize::from(opcode - op::PUSH1) + 2
+            } else {
+                1
+            };
+        }
+        let padded = Bytecode::new_legacy(bytes.into());
+        // SAFETY: The bytecode has ordinary immediate padding and a bounded jump table.
+        let bytecode =
+            unsafe { Bytecode::new_analyzed(padded.bytes().clone(), padded.len(), jumps) };
+        let chunk = CodeChunk {
+            bytecode,
+            prepared: Some(PreparedCodeChunk {
+                code_size: self.bytes.len() as u32,
+                index: index as u32,
+                payload_len: end - start,
+            }),
+        };
+        *cached = Some(chunk.clone());
+        Some(chunk)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_last_chunk_size() {
+        for size in
+            [CODE_CHUNK_SIZE + 1, 2 * CODE_CHUNK_SIZE, 2 * CODE_CHUNK_SIZE + 1, MAX_CODE_SIZE]
+        {
+            let metadata = code_metadata(&alloc::vec![op::STOP; size]).unwrap().unwrap();
+            let count = size.div_ceil(CODE_CHUNK_SIZE);
+            let last_chunk_size = size - (count - 1) * CODE_CHUNK_SIZE;
+            assert_eq!(metadata.code_size() as usize, size);
+            assert_eq!(metadata.chunk_hashes().len(), count);
+            assert_eq!(metadata.last_chunk_size() as usize, last_chunk_size);
+            for index in 0..count - 1 {
+                assert_eq!(metadata.chunk_len(index as u32), Some(CODE_CHUNK_SIZE));
+            }
+            assert_eq!(metadata.chunk_len(count as u32 - 1), Some(last_chunk_size));
+            assert_eq!(metadata.chunk_len(count as u32), None);
+            assert_eq!(metadata.chunk_len(u32::MAX), None);
+        }
+    }
+
+    #[test]
+    fn metadata_rejects_invalid_size_and_count() {
+        for (last_chunk_size, count) in [
+            (0, 2),
+            (CODE_CHUNK_SIZE as u32 + 1, 2),
+            (u32::MAX, 2),
+            (1, 0),
+            (1, 1),
+            (1, MAX_CODE_CHUNKS + 1),
+        ] {
+            assert_eq!(
+                CodeMetadata::new(last_chunk_size, alloc::vec![B256::ZERO; count]),
+                Err(CodeChunkError::InvalidMetadata)
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn metadata_serde_last_chunk_size() {
+        let metadata = CodeMetadata::new(7, alloc::vec![B256::ZERO; 3]).unwrap();
+        let json = serde_json::json!({
+            "last_chunk_size": 7,
+            "chunk_hashes": [B256::ZERO, B256::ZERO, B256::ZERO],
+        });
+        assert_eq!(serde_json::to_value(&metadata).unwrap(), json);
+        assert_eq!(serde_json::from_value::<CodeMetadata>(json).unwrap(), metadata);
+        for last_chunk_size in [0, CODE_CHUNK_SIZE as u32 + 1] {
+            let json = serde_json::json!({
+                "last_chunk_size": last_chunk_size,
+                "chunk_hashes": [B256::ZERO, B256::ZERO],
+            });
+            assert!(serde_json::from_value::<CodeMetadata>(json).is_err());
+        }
+    }
+
+    #[test]
+    fn initcode_prepares_only_requested_chunks() {
+        let mut initcode = Initcode::new(alloc::vec![op::STOP; MAX_INITCODE_SIZE].into());
+        assert!(initcode.chunks.iter().all(Option::is_none));
+        initcode.chunk(0).unwrap();
+        let last = initcode.chunks.len() - 1;
+        initcode.chunk(last as u32).unwrap();
+        assert_eq!(initcode.chunks.iter().filter(|chunk| chunk.is_some()).count(), 2);
+        assert!(initcode.chunks[1..last].iter().all(Option::is_none));
+        assert!(initcode.chunk(last as u32 + 1).is_none());
+    }
 }

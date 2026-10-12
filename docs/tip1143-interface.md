@@ -4,7 +4,7 @@ This is an opt-in, unscheduled draft. It does not select an activation date or c
 
 ## Logical code and stored chunks
 
-`Version::with_tip1143(bool)` controls `EvmFeatures::TIP1143`. Logical runtime slices contain at most 24,540 bytes (`24 KiB - 36`), up to 40 slices and 981,600 bytes in total. Initcode remains resident with a separate 1,966,080-byte limit. Chunk tariffs are provisionally 28,680 cold and 1,000 warm gas. Disabling the draft restores the previous limits.
+`Version::with_tip1143(bool)` controls `EvmFeatures::TIP1143`. Logical runtime slices contain at most 24,540 bytes (`24 KiB - 36`), up to 40 slices and 981,600 bytes in total. Initcode has a separate 2,097,152-byte (2 MiB) limit and is prepared for execution in chunks on demand. Chunk tariffs are provisionally 28,680 cold and 1,000 warm gas. Disabling the draft restores the previous limits.
 
 Each prepared chunk has this stored format:
 
@@ -26,7 +26,7 @@ The tail is `RJUMP -35` (`e0 5a 38`) when another logical instruction follows, o
 
 JUMP, taken JUMPI, ordinary RJUMP and taken RJUMPI require a JUMPDEST in the logical payload. Leading immediate bytes are never valid destinations, even when their value is `0x5b`. Ordinary jumps cannot address another chunk's padding through logical positions. There is no runtime bytecode rewriting based on entry offset.
 
-`RJUMP` (`0xe0`) costs 2 gas and uses two EIP-8024-encoded immediate bytes. Each byte belongs to the DUPN/SWAPN alphabet `00..5a` or `80..ff`: decode with `decode_single`, subtract 17, and combine as `high * 219 + low`; values above 23980 subtract 47961. The signed range is -23980 through +23980, relative to the logical PC after the three-byte instruction. Ordinary targets must be inside logical code. Both relative opcodes are unknown unless TIP-1143 is enabled, including resident initcode.
+`RJUMP` (`0xe0`) costs 2 gas and uses two EIP-8024-encoded immediate bytes. Each byte belongs to the DUPN/SWAPN alphabet `00..5a` or `80..ff`: decode with `decode_single`, subtract 17, and combine as `high * 219 + low`; values above 23980 subtract 47961. The signed range is -23980 through +23980, relative to the logical PC after the three-byte instruction. Ordinary targets must be inside logical code. Both relative opcodes are unknown unless TIP-1143 is enabled, including initcode.
 
 `bytecode()` returns the shared Bytecode. `bytes()` returns its stored bytes without memory safety padding; `payload_len()` excludes the 32-byte padding, tail and offset byte.
 
@@ -37,10 +37,10 @@ CODECOPY and EXTCODECOPY copy original payload positions directly, excluding all
 `AccountInfo::extension` is the only source of account code type. It is always available, including in builds without default features; there is no separate `account-ext` feature or opaque account payload.
 
 - Empty extension: ordinary code, with emptiness determined by `code_hash`.
-- Version 1: `AccountExtension::chunked(CodeMetadata)` contains logical code size and ordered prepared-buffer hashes. Metadata validates lengths 24,541 through 981,600 and exactly `ceil(size / 24540)` hashes.
+- Version 1: `AccountExtension::chunked(CodeMetadata)` contains the last chunk size and ordered prepared-buffer hashes. Metadata validates a last chunk size in `1..=24540` and 2 through 40 hashes; the full logical size is derived from these fields.
 - Version 2: `AccountExtension::delegated(Address)` contains the delegation target. The ordinary account code hash commits to its marker.
 
-`AccountExtension::encode` emits empty bytes, `1 || code_size_be_u32 || chunk_hashes`, or `2 || target_20_bytes`. `decode` rejects unknown versions, invalid sizes/counts, malformed lengths and zero delegation targets. Serde uses this byte encoding and omits empty extensions from account records. Client account/trie codecs must preserve the selected type and commitments.
+`AccountExtension::encode` emits empty bytes, `1 || last_chunk_size_be_u32 || chunk_hashes`, or `2 || target_20_bytes`. The last chunk size is in `1..=CODE_CHUNK_SIZE`; the full code size is `(chunk_hashes.len() - 1) * CODE_CHUNK_SIZE + last_chunk_size`. `decode` rejects unknown versions, invalid sizes/counts, malformed lengths and zero delegation targets. Serde uses this byte encoding and omits empty extensions from account records. Client account/trie codecs must preserve the selected type and commitments.
 
 `AccountInfo::code_metadata()` and `delegation_target()` read the extension. `inline_delegation_code()` validates the target and marker hash, then synthesizes the marker without payload I/O or a chunk tariff. Providers must normalize historical delegation records into version 2 metadata when loading accounts. There is no execution-time kind lookup or fallback to a cached bytecode kind. Only one delegation hop is followed.
 
@@ -64,11 +64,15 @@ Account warmth is keyed by owner and index. Journals restore warmth and code ide
 
 ## Execution and client handoff
 
-`LoadedCode` and `MessageExt` carry one `code_chunk` container. `MessageExt::is_lazy_code` explicitly selects lazy runtime loading and chunk tariffs. It is false for resident initcode, synthesized delegation markers and pre-TIP frames. The interpreter obtains its active bytecode view from the chunk.
+`MessageExt::code_source` separates temporary initcode from account code. `Some(CodeSource::Account)` loads chunks through the account host and applies account warmth and tariffs. `Some(CodeSource::Initcode(bytes))` owns immutable transaction input or a snapshot of a CREATE/CREATE2 memory range. `None` executes the resident `code_chunk`, including synthesized delegation markers and pre-TIP frames. The interpreter retains one active `CodeChunk` execution view.
+
+Large initcode uses one linear PUSH-boundary scan and caches execution buffers only for chunks entered by execution. Each buffer includes up to 32 original lookahead bytes for crossing immediates and ordinary zero padding at EOF. Initcode dispatch switches buffers between instructions, without executing generated padding or charging a boundary tariff. Account runtime retains its existing generated-tail layout. Jump validity follows the resident interpreter's PUSH-only analysis, including unusual byte sequences inside other immediate encodings.
+
+Initcode PC and CODESIZE remain global. CODECOPY reads original input bytes directly and zero-fills out-of-range reads without preparing execution buffers. Account reads, including EXTCODECOPY and calls made by a constructor, still use account loading and tariffs. Input-word gas, CREATE2 hashing of the entire original input, memory expansion, and copy gas are unchanged. The 2 MiB size ceiling does not override transaction gas caps or the transaction data gas floor; these can impose a lower practical input limit. The initcode source and prepared cache are temporary; RETURN output alone is validated, charged for deposit, and installed. REVERT, exceptional halts, failed deposit, and enclosing-frame rollback retain ordinary creation semantics.
 
 Both explicit jump opcodes use unchanged global positions. Untaken JUMPI does not read or warm its target. Cross-chunk jumps and internal fallthrough reserve destination gas before I/O. Copy operations read logical payload bytes directly from prepared buffers. Inline marker copies are synthesized from account metadata. Legacy EXTCODECOPY keeps its 24,576-byte source threshold, independent of the new runtime stride.
 
-Draft frames, including resident initcode, run through the interpreter; JIT/AOT support is deferred. Inspectors must report original PCs and omit internal padding and tails. Creation limits apply through transaction, embedding, CREATE and CREATE2 paths, while ordinary gas, memory and deposit constraints remain.
+Draft frames, including initcode, run through the interpreter; JIT/AOT support is deferred. Inspectors must report original PCs and omit internal padding and tails. Creation limits apply through transaction, embedding, CREATE and CREATE2 paths, while ordinary gas, memory and deposit constraints remain.
 
 Reth/Tempo must authenticate ingestion, atomically persist prepared buffers, scalar context and account type, preserve historical state views, reconstruct original RPC bytes, and use one coherent immutable dependency graph. Production inventory, replay, proof growth, provider latency, prepared-buffer costs and final tariff decisions remain activation prerequisites.
 

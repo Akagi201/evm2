@@ -1,10 +1,12 @@
 use super::{
-    BytecodeRef, Gas, Host, InstrStop, Memory, Message, MessageKind, Pc, Result, StackBacking,
-    StackMut, StackRef, Word,
+    BytecodeRef, CodeSource, Gas, Host, InstrStop, Memory, Message, MessageKind, Pc, Result,
+    StackBacking, StackMut, StackRef, Word,
 };
 use crate::{
     EvmTypesHost, ExecutionConfig, ExecutionError, HostError, SpecId, Version,
-    bytecode::{Bytecode, CODE_CHUNK_SIZE, COLD_CODE_CHUNK_GAS, CodeChunk, WARM_CODE_CHUNK_GAS},
+    bytecode::{
+        Bytecode, CODE_CHUNK_SIZE, COLD_CODE_CHUNK_GAS, CodeChunk, Initcode, WARM_CODE_CHUNK_GAS,
+    },
     env::TxEnv,
     evm::inspector::Inspector,
     interpreter::dispatch,
@@ -49,6 +51,7 @@ pub struct Interpreter<'frame, 'host, T: EvmTypesHost> {
     code_size: usize,
     inspecting_internal_tail: bool,
     chunk_tail_offset: Option<usize>,
+    initcode: Option<Initcode>,
 }
 
 // SAFETY: The interpreter's internal pointers are always valid. `pc` and `bytecode_ref` point into
@@ -97,6 +100,7 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
             code_size: 0,
             inspecting_internal_tail: false,
             chunk_tail_offset: None,
+            initcode: None,
             return_data: Bytes::new(),
             host: None,
             inspector: None,
@@ -109,20 +113,33 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
 
     /// Initializes this interpreter for a new frame, retaining reusable allocations.
     fn init(&mut self, tx_env: &'frame TxEnv<T>, message: &'frame Message<T>) {
-        let bytecode = message.code_chunk.bytecode();
-        self.chunk_tail_offset = message
-            .is_lazy_code
-            .then(|| message.code_chunk.prepared().map(|p| p.tail_offset()))
+        self.initcode = None;
+        let (chunk, chunked, code_size) = match &message.code_source {
+            Some(CodeSource::Initcode(bytes)) if bytes.len() > CODE_CHUNK_SIZE => {
+                let initcode = self.initcode.insert(Initcode::new(bytes.clone()));
+                (initcode.chunk(0).expect("nonempty initcode"), true, bytes.len())
+            }
+            Some(CodeSource::Initcode(bytes)) => {
+                (CodeChunk::new(bytes.clone()), false, bytes.len())
+            }
+            source => (
+                message.code_chunk.clone(),
+                matches!(source, Some(CodeSource::Account)),
+                message.code_size,
+            ),
+        };
+        let bytecode = chunk.bytecode();
+        self.chunk_tail_offset = (chunked && self.initcode.is_none())
+            .then(|| chunk.prepared().map(|p| p.tail_offset()))
             .flatten();
         let gas_limit = message.gas_limit;
         let is_static = message.caller_is_static || matches!(message.kind, MessageKind::StaticCall);
         self.pc = bytecode.bytes_slice().as_ptr();
         self.bytecode_ref = None;
         self.bytecode = bytecode;
-        self.code_chunk = message.is_lazy_code.then(|| message.code_chunk.clone());
+        self.code_chunk = chunked.then_some(chunk);
         self.code_chunk_index = 0;
-        self.code_size =
-            if self.code_chunk.is_some() { message.code_size } else { self.bytecode.len() };
+        self.code_size = if self.code_chunk.is_some() { code_size } else { self.bytecode.len() };
         self.inspecting_internal_tail = false;
         self.stack_len = 0;
         self.gas = Gas::new_with_execution_gas_and_reservoir(gas_limit, message.reservoir);
@@ -136,10 +153,11 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
         self.return_data = Bytes::new();
     }
 
-    pub(crate) const fn clear_frame_refs(&mut self) {
+    pub(crate) fn clear_frame_refs(&mut self) {
         self.tx_env = None;
         self.message = None;
         self.host = None;
+        self.initcode = None;
         self.inspector = None;
     }
 
@@ -222,7 +240,11 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     /// Calculates or returns the cached hash of the original active bytecode.
     #[inline]
     pub fn original_bytecode_hash(&self) -> B256 {
-        if self.code_chunk.is_some() {
+        if let Some(CodeSource::Initcode(bytes)) =
+            self.message.and_then(|message| message.code_source.as_ref())
+        {
+            alloy_primitives::keccak256(bytes)
+        } else if self.code_chunk.is_some() {
             self.message.expect("initialized frame").code_hash
         } else {
             self.bytecode.hash_slow()
@@ -809,7 +831,7 @@ mod bytecode_padding_tests {
 }
 
 impl<T: EvmTypesHost> InterpreterState<'_, '_, T> {
-    /// Whether this runtime frame loads its code through the chunk host interface.
+    /// Whether this frame executes through chunked bytecode buffers.
     pub const fn is_chunked_code(&self) -> bool {
         self.0.code_chunk.is_some()
     }
@@ -870,6 +892,36 @@ impl<T: EvmTypesHost> InterpreterState<'_, '_, T> {
     pub(crate) fn activate_code_chunk(&mut self, index: u32, chunk: CodeChunk) {
         self.0.activate_chunk(index, chunk);
     }
+
+    /// Loads an execution chunk from frame-local initcode or the account host.
+    pub(crate) fn execution_code_chunk(&mut self, gas: &mut Gas, index: u32) -> Result<CodeChunk> {
+        if let Some(initcode) = &mut self.0.initcode {
+            return Ok(initcode.chunk(index).expect("validated initcode index"));
+        }
+        let address = self.message().code_address;
+        gas.spend(self.chunk_tariff(&address, index))?;
+        self.required_code_chunk(&address, index)
+    }
+
+    /// Switches initcode buffers between instructions without executing or charging padding.
+    #[inline]
+    pub(crate) fn advance_initcode_pc(&mut self, pc: &mut Pc) {
+        if self.0.initcode.is_none() {
+            return;
+        }
+        let local = self.bytecode().pc_offset(*pc);
+        if local < self.active_chunk().payload_len() {
+            return;
+        }
+        let next_pc = self.global_pc(*pc);
+        if next_pc >= self.code_size() {
+            return;
+        }
+        let index = (next_pc / CODE_CHUNK_SIZE) as u32;
+        let chunk = self.0.initcode.as_mut().unwrap().chunk(index).expect("in-range initcode");
+        self.activate_code_chunk(index, chunk);
+        unsafe { pc.set_unchecked(self.bytecode(), next_pc % CODE_CHUNK_SIZE) };
+    }
 }
 
 /// A required payload unexpectedly absent from a custom host implementation.
@@ -883,7 +935,8 @@ struct MissingRuntimeChunk {
 impl<T: EvmTypesHost> Interpreter<'_, '_, T> {
     /// Activates the single prepared bytecode and rebuilds its borrowed view.
     fn activate_chunk(&mut self, index: u32, chunk: CodeChunk) {
-        self.chunk_tail_offset = chunk.prepared().map(|p| p.tail_offset());
+        self.chunk_tail_offset =
+            self.initcode.is_none().then(|| chunk.prepared().map(|p| p.tail_offset())).flatten();
         self.bytecode_ref = None;
         self.bytecode = chunk.bytecode();
         self.code_chunk = Some(chunk);
@@ -893,5 +946,201 @@ impl<T: EvmTypesHost> Interpreter<'_, '_, T> {
         let bytecode = unsafe { trustme::decouple_lt(&self.bytecode) };
         self.bytecode_ref = Some(BytecodeRef::new(bytecode));
         self.pc = self.bytecode.bytes_slice().as_ptr();
+    }
+}
+
+#[cfg(test)]
+mod initcode_tests {
+    use super::*;
+    use crate::{
+        BaseEvmConfigSelector,
+        bytecode::MAX_INITCODE_SIZE,
+        env::TxEnvExt,
+        interpreter::{MessageExt, instructions::encode_rjump_offset, op},
+        test_utils::{TestHost, TestTypes},
+    };
+    use alloc::vec;
+
+    fn compare_initcode(code: Vec<u8>, expected: InstrStop) {
+        let bytes = Bytes::from(code);
+        let tx = TxEnvExt::default();
+        let resident = MessageExt {
+            gas_limit: 10_000_000,
+            code_chunk: CodeChunk::new(bytes.clone()),
+            ..Default::default()
+        };
+        let chunked = MessageExt {
+            code_chunk: CodeChunk::default(),
+            code_source: Some(CodeSource::Initcode(bytes)),
+            ..resident.clone()
+        };
+        let mut host = TestHost {
+            execution_config: ExecutionConfig::for_base_spec::<BaseEvmConfigSelector>(
+                SpecId::OSAKA,
+            )
+            .with_version(Version::base(SpecId::OSAKA).with_tip1143(true)),
+            ..Default::default()
+        };
+        let mut resident = Interpreter::<TestTypes>::new(&tx, &resident);
+        let mut chunked = Interpreter::<TestTypes>::new(&tx, &chunked);
+        assert_eq!(resident.run(&mut host).unwrap(), expected);
+        assert_eq!(chunked.run(&mut host).unwrap(), expected);
+        assert_eq!(chunked.gas().remaining(), resident.gas().remaining());
+        assert_eq!(chunked.stack().as_slice(), resident.stack().as_slice());
+        assert_eq!(chunked.memory().as_slice(), resident.memory().as_slice());
+        assert_eq!(chunked.output(), resident.output());
+    }
+
+    #[test]
+    fn initcode_fallthrough_preserves_pc_and_gas() {
+        let mut code = vec![op::JUMPDEST; CODE_CHUNK_SIZE + 1];
+        code.extend([op::PC, op::GAS, op::CODESIZE, op::STOP]);
+        compare_initcode(code, InstrStop::Stop);
+    }
+
+    #[test]
+    fn initcode_crossing_push_and_truncated_immediates() {
+        for continuation in 1..=32 {
+            let mut code = vec![op::JUMPDEST; CODE_CHUNK_SIZE - (33 - continuation)];
+            code.push(op::PUSH32);
+            code.extend([op::JUMPDEST; 32]);
+            code.extend([op::PC, op::GAS, op::STOP]);
+            compare_initcode(code, InstrStop::Stop);
+        }
+        let mut code = vec![op::JUMPDEST; CODE_CHUNK_SIZE - 1];
+        code.extend([op::PUSH32, 0x12]);
+        compare_initcode(code, InstrStop::Stop);
+    }
+
+    #[test]
+    fn initcode_jumps_forward_and_back() {
+        let target = 3 * CODE_CHUNK_SIZE;
+        let mut code = vec![op::STOP; target + 7];
+        code[..10].copy_from_slice(&[
+            op::PUSH3,
+            (target >> 16) as u8,
+            (target >> 8) as u8,
+            target as u8,
+            op::JUMP,
+            op::JUMPDEST,
+            op::PC,
+            op::GAS,
+            op::STOP,
+            op::STOP,
+        ]);
+        code[target..].copy_from_slice(&[
+            op::JUMPDEST,
+            op::PC,
+            op::PUSH1,
+            5,
+            op::JUMP,
+            op::INVALID,
+            op::STOP,
+        ]);
+        compare_initcode(code, InstrStop::Stop);
+    }
+
+    #[test]
+    fn initcode_rejects_jump_into_continued_push() {
+        let target = CODE_CHUNK_SIZE;
+        let mut code = vec![op::STOP; target + 33];
+        code[..4].copy_from_slice(&[op::PUSH2, (target >> 8) as u8, target as u8, op::JUMP]);
+        code[target - 1] = op::PUSH32;
+        code[target] = op::JUMPDEST;
+        compare_initcode(code, InstrStop::InvalidJump);
+    }
+
+    #[test]
+    fn initcode_untaken_jump_does_not_validate_destination() {
+        let mut code = vec![op::INVALID; MAX_INITCODE_SIZE];
+        code[..5].copy_from_slice(&[op::PUSH0, op::PUSH1, 99, op::JUMPI, op::STOP]);
+        compare_initcode(code, InstrStop::Stop);
+    }
+
+    #[test]
+    fn initcode_relative_jump_crosses_boundary() {
+        let mut code = vec![op::JUMPDEST; CODE_CHUNK_SIZE - 1];
+        code.push(op::RJUMP);
+        code.extend(encode_rjump_offset(1).unwrap());
+        code.extend([op::INVALID, op::JUMPDEST, op::PC, op::GAS, op::STOP]);
+        compare_initcode(code, InstrStop::Stop);
+    }
+
+    #[test]
+    fn initcode_codecopy_reads_original_bytes_and_zero_fills() {
+        for offset in [CODE_CHUNK_SIZE - 16, MAX_INITCODE_SIZE - 16, MAX_INITCODE_SIZE + 1] {
+            let mut code = vec![0xab; MAX_INITCODE_SIZE];
+            code[..13].copy_from_slice(&[
+                op::PUSH1,
+                64,
+                op::PUSH3,
+                (offset >> 16) as u8,
+                (offset >> 8) as u8,
+                offset as u8,
+                op::PUSH0,
+                op::CODECOPY,
+                op::PUSH1,
+                64,
+                op::PUSH0,
+                op::RETURN,
+                op::STOP,
+            ]);
+            compare_initcode(code, InstrStop::Return);
+        }
+    }
+
+    #[test]
+    fn initcode_preserves_legacy_jump_analysis_inside_invalid_relative_immediates() {
+        for (target, operand, expected) in [
+            (CODE_CHUNK_SIZE + 1, op::STOP, InstrStop::Stop),
+            (CODE_CHUNK_SIZE + 20, op::PUSH32, InstrStop::InvalidJump),
+        ] {
+            let mut code = vec![op::STOP; CODE_CHUNK_SIZE + 40];
+            code[..4].copy_from_slice(&[op::PUSH2, (target >> 8) as u8, target as u8, op::JUMP]);
+            code[CODE_CHUNK_SIZE - 1] = op::RJUMP;
+            code[CODE_CHUNK_SIZE] = operand;
+            code[target] = op::JUMPDEST;
+            compare_initcode(code, expected);
+        }
+    }
+
+    #[derive(Default)]
+    struct InitcodeTrace(Vec<(bool, usize, u64)>);
+
+    impl Inspector<TestTypes> for InitcodeTrace {
+        fn step(&mut self, interp: &mut Interpreter<'_, '_, TestTypes>) {
+            self.0.push((false, interp.pc(), interp.gas().remaining()));
+        }
+
+        fn step_end(&mut self, interp: &mut Interpreter<'_, '_, TestTypes>) {
+            self.0.push((true, interp.pc(), interp.gas().remaining()));
+        }
+    }
+
+    #[test]
+    fn initcode_inspector_trace_matches_resident_execution() {
+        let mut code = vec![op::JUMPDEST; CODE_CHUNK_SIZE - 1];
+        code.extend([op::PUSH2, 0x12, 0x34, op::PC, op::GAS, op::STOP]);
+        let bytes = Bytes::from(code);
+        let tx = TxEnvExt::default();
+        let resident = MessageExt {
+            gas_limit: 100_000,
+            code_chunk: CodeChunk::new(bytes.clone()),
+            ..Default::default()
+        };
+        let chunked = MessageExt {
+            code_chunk: CodeChunk::default(),
+            code_source: Some(CodeSource::Initcode(bytes)),
+            ..resident.clone()
+        };
+        let mut host = TestHost::default();
+        let mut expected = InitcodeTrace::default();
+        let mut actual = InitcodeTrace::default();
+        let mut resident = Interpreter::<TestTypes>::new(&tx, &resident);
+        let mut chunked = Interpreter::<TestTypes>::new(&tx, &chunked);
+        assert_eq!(chunked.original_bytecode_hash(), resident.original_bytecode_hash());
+        assert_eq!(resident.run_inspect(&mut host, &mut expected).unwrap(), InstrStop::Stop);
+        assert_eq!(chunked.run_inspect(&mut host, &mut actual).unwrap(), InstrStop::Stop);
+        assert_eq!(actual.0, expected.0);
     }
 }

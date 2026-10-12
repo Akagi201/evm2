@@ -2,7 +2,9 @@ use crate::{
     EvmFeatures, EvmTypesHost,
     bytecode::{Bytecode, CODE_CHUNK_SIZE, LEGACY_CODE_CHUNK_SIZE},
     evm::AccountLoad,
-    interpreter::{Gas, Host, InstrStop, Memory, Result, Word, private::GasInstructionCx},
+    interpreter::{
+        CodeSource, Gas, Host, InstrStop, Memory, Result, Word, private::GasInstructionCx,
+    },
     utils::{
         address_to_word, b256_to_word, word_to_address, word_to_usize, word_to_usize_saturated,
     },
@@ -112,6 +114,18 @@ pub fn codecopy(cx: _, [memory_offset, code_offset, len]: [Word]) -> Result {
     // SAFETY: Charging and copying data make no host calls.
     let gas_params = unsafe { cx.state.gas_params_detached() };
     cx.gas.spend(gas_params.copy_cost(len))?;
+    if let Some(CodeSource::Initcode(bytes)) = &cx.state.message().code_source {
+        let bytes = bytes.clone();
+        return copy_data(
+            cx.gas,
+            &mut cx.state.0.memory,
+            gas_params,
+            memory_offset,
+            code_offset,
+            len,
+            &bytes,
+        );
+    }
     if cx.state.is_chunked_code() {
         if len == 0 {
             return Ok(());

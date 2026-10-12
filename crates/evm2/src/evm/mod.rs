@@ -121,8 +121,8 @@ use crate::{
     constants::{CALL_DEPTH_LIMIT, EIP7708_TRANSFER_TOPIC},
     env::{BlockEnv, TxEnv},
     interpreter::{
-        Gas, GasTracker, Host, InstrStop, Interpreter, InterpreterPool, Message, MessageKind,
-        MessageResult, MessageResultExt, Word,
+        CodeSource, Gas, GasTracker, Host, InstrStop, Interpreter, InterpreterPool, Message,
+        MessageKind, MessageResult, MessageResultExt, Word,
     },
     registry::{HandlerResult, TxRegistry},
     trustme,
@@ -1193,10 +1193,17 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
 
     #[inline(never)]
     fn prepare_create_message(&mut self, message: &mut Message<T>) -> Result<(), HostError> {
-        if self.feature(EvmFeatures::TIP1143)
-            && message.code_chunk.payload_len() > self.version().max_initcode_size
-        {
-            return Err(InstrStop::CreateInitCodeSizeLimit.into());
+        if self.feature(EvmFeatures::TIP1143) {
+            let bytes = match &message.code_source {
+                Some(CodeSource::Initcode(bytes)) => bytes.clone(),
+                _ => message.code_chunk.bytecode().original_bytes(),
+            };
+            if bytes.len() > self.version().max_initcode_size {
+                return Err(InstrStop::CreateInitCodeSizeLimit.into());
+            }
+            message.code_size = bytes.len();
+            message.code_source = Some(CodeSource::Initcode(bytes));
+            message.code_chunk = Default::default();
         }
         let info = if message.value > 0 || message.depth > 0 {
             self.state.account_info_untracked(&message.caller).map_err(HostError::from)?
@@ -1878,11 +1885,14 @@ fn eip7708_transfer_log(from: &Address, to: &Address, value: &Word) -> Option<Lo
 }
 
 #[cfg(test)]
+mod code_loading_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         BaseEvmConfigSelector, BaseEvmTypes, NoopInspector, Precompiles, SpecId, Version,
-        bytecode::Bytecode,
+        bytecode::{Bytecode, CODE_CHUNK_SIZE, CodeChunk, MAX_INITCODE_SIZE},
         env::{BlockEnvExt, TxEnvExt},
         ethereum::{RecoveredTxEnvelope, TxEnvelope, ethereum_tx_registry},
         interpreter::{GasTracker, Interpreter, Message, MessageExt, MessageKind, op},
@@ -2052,7 +2062,7 @@ mod tests {
             input: Bytes::new(),
             value: U256::ZERO,
             code_chunk: (Bytecode::default()).into(),
-            is_lazy_code: false,
+            code_source: None,
             code_size: 0,
             code_hash: B256::ZERO,
             code_address: address,
@@ -2916,7 +2926,7 @@ mod tests {
             input: Bytes::from_static(b"message input"),
             value: U256::from(99),
             code_chunk: (Bytecode::default()).into(),
-            is_lazy_code: false,
+            code_source: None,
             code_size: 0,
             code_hash: B256::ZERO,
             code_address: address,
@@ -4157,5 +4167,204 @@ mod tests {
                 Word::from(1)
             );
         }
+    }
+
+    fn chunked_initcode_evm() -> Evm<'static, BaseEvmTypes> {
+        Evm::new_with_execution_config(
+            ExecutionConfig::for_base_spec::<BaseEvmConfigSelector>(SpecId::OSAKA)
+                .with_version(Version::base(SpecId::OSAKA).with_tip1143(true)),
+            SpecId::OSAKA,
+            BlockEnvExt::default(),
+            ethereum_tx_registry(SpecId::OSAKA),
+            DbStats::new(InMemoryDB::default()),
+            Precompiles::base(SpecId::OSAKA),
+        )
+    }
+
+    fn large_initcode(stop: u8, runtime_size: usize) -> Bytes {
+        let target = MAX_INITCODE_SIZE - 32;
+        let mut code = vec![op::STOP; MAX_INITCODE_SIZE];
+        code[..5].copy_from_slice(&[
+            op::PUSH3,
+            (target >> 16) as u8,
+            (target >> 8) as u8,
+            target as u8,
+            op::JUMP,
+        ]);
+        let constructor = [
+            op::JUMPDEST,
+            op::PUSH1,
+            42,
+            op::PUSH0,
+            op::SSTORE,
+            op::PUSH3,
+            (runtime_size >> 16) as u8,
+            (runtime_size >> 8) as u8,
+            runtime_size as u8,
+            op::PUSH1,
+            32,
+            op::PUSH0,
+            op::CODECOPY,
+            op::PUSH3,
+            (runtime_size >> 16) as u8,
+            (runtime_size >> 8) as u8,
+            runtime_size as u8,
+            op::PUSH0,
+            stop,
+        ];
+        code[target..target + constructor.len()].copy_from_slice(&constructor);
+        code.into()
+    }
+
+    #[test]
+    fn chunked_initcode_creation_commits_only_on_success() {
+        for (stop, gas_limit, expected) in [
+            (op::RETURN, 10_000_000, InstrStop::Return),
+            (op::REVERT, 10_000_000, InstrStop::Revert),
+            (op::INVALID, 10_000_000, InstrStop::InvalidFEOpcode),
+            (op::RETURN, 100_000, InstrStop::OutOfGas),
+        ] {
+            let mut evm = chunked_initcode_evm();
+            let address = Address::with_last_byte(0x71);
+            let initcode = large_initcode(stop, CODE_CHUNK_SIZE + 3);
+            let mut message = MessageExt {
+                kind: MessageKind::Create,
+                destination: address,
+                gas_limit,
+                code_source: Some(CodeSource::Initcode(initcode)),
+                ..Default::default()
+            };
+            let result =
+                Host::execute_message(&mut evm, &TxEnvExt::default(), &mut message).unwrap();
+            assert_eq!(result.stop, expected);
+            assert_eq!(result.created_address, (expected == InstrStop::Return).then_some(address));
+            let account = evm.state.account(&address).unwrap();
+            if expected == InstrStop::Return {
+                let metadata = account.get().unwrap().code_metadata().unwrap();
+                assert_eq!(metadata.code_size() as usize, CODE_CHUNK_SIZE + 3);
+                assert_eq!(metadata.last_chunk_size(), 3);
+                assert_eq!(metadata.chunk_hashes().len(), 2);
+            } else {
+                assert!(account.get().is_none());
+            }
+            drop(account);
+            assert_eq!(
+                evm.state.storage_slot_untracked(&address, &Word::ZERO).unwrap(),
+                Word::from(if expected == InstrStop::Return { 42 } else { 0 })
+            );
+            let counts = evm.database().downcast_ref::<DbStats<InMemoryDB>>().unwrap().counts();
+            assert_eq!(counts.get_code_by_hash, 0);
+            assert_eq!(counts.get_code_chunk_by_hash, 0);
+        }
+    }
+
+    #[test]
+    fn chunked_initcode_factory_create_and_create2_rollback() {
+        let factory = Address::with_last_byte(0x72);
+        let initcode = large_initcode(op::RETURN, 1);
+        for is_create2 in [false, true] {
+            for revert_parent in [false, true] {
+                let mut evm = chunked_initcode_evm();
+                evm.overlay_db_mut()
+                    .insert_account_info(&factory, AccountInfo::default().with_nonce(1));
+                let len = initcode.len();
+                let mut code = vec![
+                    op::PUSH3,
+                    (len >> 16) as u8,
+                    (len >> 8) as u8,
+                    len as u8,
+                    op::PUSH0,
+                    op::PUSH0,
+                    op::CALLDATACOPY,
+                ];
+                if is_create2 {
+                    code.push(op::PUSH0);
+                }
+                code.extend([
+                    op::PUSH3,
+                    (len >> 16) as u8,
+                    (len >> 8) as u8,
+                    len as u8,
+                    op::PUSH0,
+                    op::PUSH0,
+                    if is_create2 { op::CREATE2 } else { op::CREATE },
+                    op::PUSH0,
+                    op::MSTORE,
+                    op::PUSH1,
+                    32,
+                    op::PUSH0,
+                    if revert_parent { op::REVERT } else { op::RETURN },
+                ]);
+                let address = if is_create2 {
+                    factory.create2_from_code(B256::ZERO, &initcode)
+                } else {
+                    factory.create(1)
+                };
+                let mut message = MessageExt {
+                    destination: factory,
+                    code_address: factory,
+                    input: initcode.clone(),
+                    gas_limit: 20_000_000,
+                    code_chunk: CodeChunk::new(code.into()),
+                    ..Default::default()
+                };
+                let result =
+                    Host::execute_message(&mut evm, &TxEnvExt::default(), &mut message).unwrap();
+                assert_eq!(
+                    result.stop,
+                    if revert_parent { InstrStop::Revert } else { InstrStop::Return }
+                );
+                assert_eq!(result.output.as_ref(), address.into_word().as_slice());
+                let account = evm.state.account(&address).unwrap();
+                if revert_parent {
+                    assert!(account.get().is_none());
+                } else {
+                    assert_eq!(account.code_hash(), alloy_primitives::keccak256([op::STOP]));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chunked_initcode_enforces_complete_input_limit() {
+        let mut evm = chunked_initcode_evm();
+        let mut message = MessageExt {
+            kind: MessageKind::Create,
+            gas_limit: 100_000,
+            code_source: Some(CodeSource::Initcode(vec![op::STOP; MAX_INITCODE_SIZE + 1].into())),
+            ..Default::default()
+        };
+        let result = Host::execute_message(&mut evm, &TxEnvExt::default(), &mut message).unwrap();
+        assert_eq!(result.stop, InstrStop::CreateInitCodeSizeLimit);
+        assert_eq!(result.created_address, None);
+    }
+
+    #[test]
+    fn chunked_initcode_creation_transaction() {
+        let mut evm = chunked_initcode_evm();
+        // A 2 MiB input exceeds Osaka's default transaction cap under the data gas floor.
+        // The chunking feature preserves both rules; configure a larger cap for this test.
+        let mut version = Version::base(SpecId::OSAKA).with_tip1143(true);
+        version.tx_gas_limit_cap = 30_000_000;
+        evm.set_execution_config(
+            ExecutionConfig::for_spec_and_version(SpecId::OSAKA, version),
+            SpecId::OSAKA,
+            ethereum_tx_registry(SpecId::OSAKA),
+            Precompiles::base(SpecId::OSAKA),
+        );
+        let caller = Address::with_last_byte(0x73);
+        let tx = Recovered::new_unchecked(
+            TxEnvelope::Legacy(TxLegacy {
+                gas_limit: 30_000_000,
+                to: TxKind::Create,
+                input: large_initcode(op::RETURN, 1),
+                ..Default::default()
+            }),
+            caller,
+        );
+        let result = evm.transact(&tx).unwrap().commit();
+        assert!(result.status);
+        let account = evm.state.account(&caller.create(0)).unwrap();
+        assert_eq!(account.code_hash(), alloy_primitives::keccak256([op::STOP]));
     }
 }

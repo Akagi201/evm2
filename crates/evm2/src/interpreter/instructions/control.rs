@@ -36,14 +36,11 @@ fn jump_inner<T: EvmTypesHost>(target: Word, cx: &mut GasInstructionCx<'_, '_, '
         }
         let index = (target / CODE_CHUNK_SIZE) as u32;
         // Legacy records may be up to 24 KiB and have no prepared slicing.
-        let multi = cx.state.message().code_chunk.prepared().is_some();
+        let multi = cx.state.active_chunk().prepared().is_some();
         if multi {
             let local = target % CODE_CHUNK_SIZE;
             let chunk = if index != cx.state.code_chunk_index() {
-                let address = cx.state.message().code_address;
-                let tariff = cx.state.chunk_tariff(&address, index);
-                cx.gas.spend(tariff)?;
-                cx.state.required_code_chunk(&address, index)?
+                cx.state.execution_code_chunk(cx.gas, index)?
             } else {
                 cx.state.active_chunk().clone()
             };
@@ -203,10 +200,7 @@ fn rjump_inner<T: EvmTypesHost>(
         let chunk = if index == cx.state.code_chunk_index() {
             cx.state.active_chunk().clone()
         } else {
-            let address = cx.state.message().code_address;
-            let tariff = cx.state.chunk_tariff(&address, index);
-            cx.gas.spend(tariff)?;
-            cx.state.required_code_chunk(&address, index)?
+            cx.state.execution_code_chunk(cx.gas, index)?
         };
         let local = if transfer {
             // Only the authenticated generated tail may enter a non-JUMPDEST.

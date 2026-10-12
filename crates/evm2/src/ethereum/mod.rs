@@ -23,7 +23,7 @@ use crate::{
         handler::{DefaultTxHandlerHooks, GasSettlement},
     },
     interpreter::{
-        GasTracker, Host, InstrStop, Message, MessageExt, MessageKind, MessageResult,
+        CodeSource, GasTracker, Host, InstrStop, Message, MessageExt, MessageKind, MessageResult,
         MessageResultExt,
         gas::{EIP2780_TX_BASE_COST, EIP8038_COLD_ACCOUNT_ACCESS, WARM_STORAGE_READ_COST},
     },
@@ -639,7 +639,7 @@ pub fn prepare_initial_frame<'a, T: EvmTypes>(
                 input: input.clone(),
                 value,
                 code_chunk: (code).into(),
-                is_lazy_code: false,
+                code_source: None,
                 code_size: 0,
                 code_hash: B256::ZERO,
                 code_address,
@@ -673,8 +673,14 @@ pub fn prepare_initial_frame<'a, T: EvmTypes>(
                 caller,
                 input: input.clone(),
                 value,
-                code_chunk: (Bytecode::new_legacy(input.clone())).into(),
-                is_lazy_code: false,
+                code_chunk: if host.feature(EvmFeatures::TIP1143) {
+                    Default::default()
+                } else {
+                    Bytecode::new_legacy(input.clone()).into()
+                },
+                code_source: host
+                    .feature(EvmFeatures::TIP1143)
+                    .then(|| CodeSource::Initcode(input.clone())),
                 code_size: input.len(),
                 code_hash: B256::ZERO,
                 code_address: destination,
@@ -1051,7 +1057,7 @@ fn prepare_initial_chunked_frame<T: EvmTypes>(
             caller,
             input: input.clone(),
             value,
-            is_lazy_code: code_chunk.is_some(),
+            code_source: code_chunk.as_ref().map(|_| CodeSource::Account),
             code_chunk: code_chunk.unwrap_or_else(|| (code).into()),
             code_size,
             code_hash: account.code_hash,

@@ -52,7 +52,7 @@ impl AccountExtension {
         }
     }
 
-    /// Returns version 1's original code size and ordered chunk hashes.
+    /// Returns version 1's last chunk size and ordered chunk hashes.
     pub fn code_metadata(&self) -> Option<&CodeMetadata> {
         match self.0.as_deref() {
             Some(CodeExtension::Chunks(metadata)) => Some(metadata),
@@ -68,14 +68,14 @@ impl AccountExtension {
         }
     }
 
-    /// Encodes empty bytes, `1 || code_size_be_u32 || hashes`, or `2 || target`.
+    /// Encodes empty bytes, `1 || last_chunk_size_be_u32 || hashes`, or `2 || target`.
     pub fn encode(&self) -> Bytes {
         match self.0.as_deref() {
             None => Bytes::new(),
             Some(CodeExtension::Chunks(metadata)) => {
                 let mut bytes = Vec::with_capacity(5 + 32 * metadata.chunk_hashes().len());
                 bytes.push(1);
-                bytes.extend_from_slice(&metadata.code_size().to_be_bytes());
+                bytes.extend_from_slice(&metadata.last_chunk_size().to_be_bytes());
                 for hash in metadata.chunk_hashes() {
                     bytes.extend_from_slice(hash.as_slice());
                 }
@@ -97,9 +97,9 @@ impl AccountExtension {
             [1, a, b, c, d, hashes @ ..]
                 if hashes.len().is_multiple_of(32) && hashes.len() <= 32 * MAX_CODE_CHUNKS =>
             {
-                let size = u32::from_be_bytes([*a, *b, *c, *d]);
+                let last_chunk_size = u32::from_be_bytes([*a, *b, *c, *d]);
                 let hashes = hashes.as_chunks::<32>().0.iter().copied().map(B256::from).collect();
-                CodeMetadata::new(size, hashes).map(Self::chunked)
+                CodeMetadata::new(last_chunk_size, hashes).map(Self::chunked)
             }
             [2, target @ ..] if target.len() == 20 => {
                 let target = Address::from_slice(target);
@@ -125,5 +125,28 @@ impl<'de> serde::Deserialize<'de> for AccountExtension {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let bytes = Bytes::deserialize(deserializer)?;
         Self::decode(&bytes).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bytecode::CODE_CHUNK_SIZE;
+
+    #[test]
+    fn chunked_encoding_stores_last_chunk_size() {
+        for last_chunk_size in [1, CODE_CHUNK_SIZE as u32] {
+            let metadata = CodeMetadata::new(last_chunk_size, alloc::vec![B256::ZERO; 3]).unwrap();
+            let extension = AccountExtension::chunked(metadata);
+            let mut expected = alloc::vec![1];
+            expected.extend_from_slice(&last_chunk_size.to_be_bytes());
+            expected.extend_from_slice(&[0; 96]);
+            assert_eq!(extension.encode().as_ref(), expected);
+            assert_eq!(AccountExtension::decode(&expected).unwrap(), extension);
+            assert_eq!(
+                extension.code_metadata().unwrap().code_size(),
+                2 * CODE_CHUNK_SIZE as u32 + last_chunk_size
+            );
+        }
     }
 }

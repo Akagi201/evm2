@@ -65,13 +65,12 @@ pub struct MessageExt<E = ()> {
     pub input: Bytes,
     /// Value transferred with the message.
     pub value: U256,
-    /// Entry code, including its cached analysis. Resident initcode and ordinary code
-    /// also use this container; its presence does not select gas rules.
+    /// Entry account or resident code, including its cached analysis.
+    /// Initcode sources prepare their own entry buffer; this field is unused for them.
     pub code_chunk: CodeChunk,
-    /// Whether runtime accesses use the lazy chunk host interface and chunk tariffs.
-    /// False for resident initcode, delegation markers, and pre-TIP execution.
-    pub is_lazy_code: bool,
-    /// Global logical size for lazy runtime code.
+    /// Source of lazily loaded code. `None` executes the resident `code_chunk`.
+    pub code_source: Option<CodeSource>,
+    /// Global logical size for account code. Initcode carries its own original bytes.
     pub code_size: usize,
     /// Global code identity, used for contextual provider errors.
     pub code_hash: B256,
@@ -113,7 +112,7 @@ impl<E> MessageExt<E> {
             input,
             value,
             code_chunk,
-            is_lazy_code,
+            code_source,
             code_size,
             code_hash,
             code_address,
@@ -134,7 +133,7 @@ impl<E> MessageExt<E> {
             input,
             value,
             code_chunk,
-            is_lazy_code,
+            code_source,
             code_size,
             code_hash,
             code_address,
@@ -164,4 +163,13 @@ pub fn derive_create_destination(
         MessageKind::Create2 => caller.create2(salt, keccak256(init_code)),
         _ => caller.create(nonce),
     }
+}
+
+/// Source of code loaded during execution, independent of the active execution buffer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CodeSource {
+    /// Immutable transaction input or a snapshot of a CREATE/CREATE2 memory range.
+    Initcode(Bytes),
+    /// Account code loaded through the host, with account chunk warmth and tariffs.
+    Account,
 }
