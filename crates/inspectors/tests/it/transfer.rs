@@ -139,7 +139,7 @@ fn discards_failed_call_transfers_and_logs() {
     let recipient = address!("0x00000000000000000000000000000000000000ff");
 
     // Calls `reverter` with 1 wei, `recipient` with 100 wei (more than the balance), and
-    // `recipient` with 2 wei.
+    // `recipient` with 2 wei. `reverter` forwards 1 wei to `recipient` and then reverts.
     let caller_code = hex!(
         "600060006000600060017320000000000000000000000000000000000000005af150"
         "6000600060006000606460ff5af150"
@@ -155,7 +155,9 @@ fn discards_failed_call_transfers_and_logs() {
     db.insert_account_info(
         &reverter,
         AccountInfo {
-            code: Some(Bytecode::new_legacy(hex!("60006000fd").into())),
+            code: Some(Bytecode::new_legacy(
+                hex!("6000600060006000600160ff5af15060006000fd").into(),
+            )),
             ..Default::default()
         },
     );
@@ -197,4 +199,47 @@ fn discards_failed_call_transfers_and_logs() {
     assert_eq!(logs[0].topics()[2], caller.into_word());
     assert_eq!(logs[1].topics()[1], caller.into_word());
     assert_eq!(logs[1].topics()[2], recipient.into_word());
+}
+
+#[test]
+fn discards_failed_internal_create_transfer_and_log() {
+    let deployer = Address::ZERO;
+    let factory = address!("0x1000000000000000000000000000000000000000");
+
+    // Creates a contract with 1 wei and init code `INVALID`.
+    let factory_code = hex!("60fe600053600160006001f05000");
+    let mut db = CacheDB::new(EmptyDB::default());
+    db.load_account(deployer).info.balance = U256::from(u64::MAX);
+    db.insert_account_info(
+        &factory,
+        AccountInfo { code: Some(Bytecode::new_legacy(factory_code.into())), ..Default::default() },
+    );
+
+    let context = Context::mainnet().with_db(db).modify_cfg_chained(|c| c.spec = SpecId::LONDON);
+    let mut evm =
+        context.build_mainnet_with_inspector(TransferInspector::new(false).with_logs(true));
+    let res = evm
+        .inspect_tx(TxEnv {
+            caller: deployer,
+            gas_limit: 1000000,
+            kind: TransactTo::Call(factory),
+            value: U256::from(10),
+            nonce: 0,
+            ..Default::default()
+        })
+        .unwrap();
+
+    assert!(res.result.is_success());
+    assert_eq!(
+        evm.inspector().transfers(),
+        &[TransferOperation {
+            kind: TransferKind::Call,
+            from: deployer,
+            to: factory,
+            value: U256::from(10),
+        }]
+    );
+    let logs = &res.tx_result.result.logs;
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].topics()[2], factory.into_word());
 }
