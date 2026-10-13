@@ -94,10 +94,9 @@ impl Cache {
     fn insert_chunks(chunks: &mut B256Map<Bytecode>, code: &Bytecode) {
         if code.len() > CODE_CHUNK_SIZE {
             let bytes = code.original_bytes();
-            for (index, _) in bytes.chunks(CODE_CHUNK_SIZE).enumerate() {
-                let index = u32::try_from(index).expect("bytecode index fits u32");
-                if let Some(chunk) = crate::bytecode::code_chunk(&bytes, index) {
-                    chunks.insert(chunk.as_bytecode().hash_slow(), chunk.bytecode());
+            if let Ok(Some((metadata, prepared))) = crate::bytecode::prepare_code_chunks(&bytes) {
+                for (hash, chunk) in metadata.chunk_hashes().iter().copied().zip(prepared) {
+                    chunks.insert(hash, chunk.bytecode());
                 }
             }
         }

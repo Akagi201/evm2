@@ -16,14 +16,14 @@ pub use lazy_eip7702::{LazyAuthorization, LazyTxEip7702};
 
 use crate::{
     Evm, EvmFeatures, EvmTypes, HostError, SpecId, TxResult, TxResultExt, Version,
-    bytecode::{Bytecode, COLD_CODE_CHUNK_GAS, WARM_CODE_CHUNK_GAS},
+    bytecode::{Bytecode, COLD_CODE_CHUNK_GAS, CodeChunk, WARM_CODE_CHUNK_GAS},
     env::TxEnv,
     evm::{
-        AccountInfo,
+        AccountInfo, CodeAccessMode,
         handler::{DefaultTxHandlerHooks, GasSettlement},
     },
     interpreter::{
-        CodeSource, GasTracker, Host, InstrStop, Message, MessageExt, MessageKind, MessageResult,
+        GasTracker, Host, InstrStop, Message, MessageExt, MessageKind, MessageResult,
         MessageResultExt,
         gas::{EIP2780_TX_BASE_COST, EIP8038_COLD_ACCOUNT_ACCESS, WARM_STORAGE_READ_COST},
     },
@@ -576,15 +576,13 @@ pub fn prepare_initial_frame<'a, T: EvmTypes>(
     let mut charged_state_gas = 0;
     let message = match to {
         TxKind::Call(to) => {
-            if host.feature(EvmFeatures::TIP1143) {
-                return prepare_initial_chunked_frame(host, caller, to, input, value, tx_gas);
-            }
-            let (recipient_is_empty, mut code) = {
-                let mut account = host.state.account(&to)?;
-                // A nonexistent recipient reads as an empty account (EIP-161).
-                let recipient_is_empty = account.get().is_none_or(AccountInfo::is_empty);
-                (recipient_is_empty, account.load_code()?)
+            let mode = CodeAccessMode::from_features(host.version().features);
+            let mut account = match Host::load_account(host, &to, mode.loads_full_code(), false) {
+                Ok(account) => account,
+                Err(HostError::Execution(error)) => return Err(error.into()),
+                Err(HostError::Halt(_)) => unreachable!("unconditional account load"),
             };
+            let recipient_is_empty = account.is_empty;
             let mut code_address = to;
             let mut disable_precompiles = false;
             if host.feature(EvmFeatures::EIP2780) && !value.is_zero() && recipient_is_empty {
@@ -594,40 +592,37 @@ pub fn prepare_initial_frame<'a, T: EvmTypes>(
                 }
                 charged_state_gas = new_account_state_gas;
             }
-            // An empty recipient is never delegated, so the charge above and the resolution below
-            // are mutually exclusive.
             if host.feature(EvmFeatures::EIP7702)
-                && let Some(delegated_address) = code.eip7702_address()
+                && let Some(delegated_address) = account.code_kind(mode).delegation_target()
             {
-                if host.feature(EvmFeatures::EIP2780) {
-                    // Delegation-target access, EIP-2929 warm/cold: charge the warm access first
-                    // (covered → the target is loaded and enters the block access list), then the
-                    // cold premium after the load. The load is skipped when the cold premium is
-                    // unaffordable, keeping a cold, unafforded target out of the block access
-                    // list.
-                    let cold_additional = host.version().gas_params.cold_account_additional_cost();
-                    if tx_gas.spend(u64::from(WARM_STORAGE_READ_COST)).is_err() {
-                        return Ok(None);
-                    }
-                    let skip_cold_load = tx_gas.remaining() < cold_additional;
-                    let load =
-                        match Host::load_account(host, &delegated_address, true, skip_cold_load) {
-                            Ok(load) => load,
-                            Err(HostError::Halt(_)) => return Ok(None),
-                            Err(HostError::Execution(error)) => return Err(error.into()),
-                        };
-                    if load.is_cold && tx_gas.spend(cold_additional).is_err() {
-                        return Ok(None);
-                    }
-                    code = load.code;
-                } else {
-                    let mut account = host.state.account(&delegated_address)?;
-                    account.warm();
-                    code = account.load_code()?;
+                let metered = host.feature(EvmFeatures::EIP2780);
+                let cold_additional = host.version().gas_params.cold_account_additional_cost();
+                if metered && tx_gas.spend(u64::from(WARM_STORAGE_READ_COST)).is_err() {
+                    return Ok(None);
+                }
+                account = match Host::load_account(
+                    host,
+                    &delegated_address,
+                    mode.loads_full_code(),
+                    metered && tx_gas.remaining() < cold_additional,
+                ) {
+                    Ok(account) => account,
+                    Err(HostError::Halt(_)) => return Ok(None),
+                    Err(HostError::Execution(error)) => return Err(error.into()),
+                };
+                if metered && account.is_cold && tx_gas.spend(cold_additional).is_err() {
+                    return Ok(None);
                 }
                 code_address = delegated_address;
                 disable_precompiles = true;
             }
+            let code = match account.code_source(mode, || {
+                load_initial_code_chunk(host, tx_gas, &code_address, account.code_hash)
+            }) {
+                Ok(code) => code,
+                Err(HostError::Halt(_)) => return Ok(None),
+                Err(HostError::Execution(error)) => return Err(error.into()),
+            };
             MessageExt {
                 kind: MessageKind::Call,
                 depth: 0,
@@ -638,8 +633,8 @@ pub fn prepare_initial_frame<'a, T: EvmTypes>(
                 caller,
                 input: input.clone(),
                 value,
-                code: (code).into(),
-                code_hash: B256::ZERO,
+                code,
+                code_hash: if mode.loads_full_code() { B256::ZERO } else { account.code_hash },
                 code_address,
                 disable_precompiles,
                 caller_is_static: false,
@@ -947,102 +942,23 @@ fn eip2780_base_to_value_gas(
     gas
 }
 
-/// Prepares a draft transaction entry without fetching unrelated runtime payloads.
-fn prepare_initial_chunked_frame<T: EvmTypes>(
+/// Loads and charges the entry chunk of a metered top-level call.
+fn load_initial_code_chunk<T: EvmTypes>(
     host: &mut Evm<'_, T>,
-    caller: Address,
-    to: Address,
-    input: &Bytes,
-    value: U256,
     tx_gas: &mut GasTracker,
-) -> HandlerResult<Option<InitialFrame<T>>> {
-    let mut account = Host::load_account(host, &to, false, false).map_err(|error| match error {
-        HostError::Execution(error) => HandlerError::from(error),
-        HostError::Halt(_) => unreachable!("unconditional metadata load"),
-    })?;
-    let mut charged_state_gas = 0;
-    if host.feature(EvmFeatures::EIP2780) && !value.is_zero() && account.is_empty {
-        charged_state_gas = host.version().gas_params.new_account_state_gas();
-        if tx_gas.spend_state(charged_state_gas).is_err() {
-            return Ok(None);
-        }
+    owner: &Address,
+    code_hash: B256,
+) -> Result<CodeChunk, HostError> {
+    tx_gas.spend(WARM_CODE_CHUNK_GAS)?;
+    let cold_additional = COLD_CODE_CHUNK_GAS - WARM_CODE_CHUNK_GAS;
+    let loaded = Host::load_code_chunk(host, owner, 0, tx_gas.remaining() < cold_additional)?
+        .ok_or_else(|| {
+            crate::DatabaseError::new(crate::CodeChunkLoadError::Missing(code_hash), true)
+        })?;
+    if loaded.is_cold {
+        tx_gas.spend(cold_additional)?;
     }
-    let mut owner = to;
-    let mut disable_precompiles = false;
-
-    if host.feature(EvmFeatures::EIP7702)
-        && let Some(target) = account.inline_delegation
-    {
-        let metered = host.feature(EvmFeatures::EIP2780);
-        let cold = host.version().gas_params.cold_account_additional_cost();
-        if metered && tx_gas.spend(u64::from(WARM_STORAGE_READ_COST)).is_err() {
-            return Ok(None);
-        }
-        account =
-            match Host::load_account(host, &target, false, metered && tx_gas.remaining() < cold) {
-                Ok(account) => account,
-                Err(HostError::Halt(_)) => return Ok(None),
-                Err(HostError::Execution(error)) => return Err(error.into()),
-            };
-        if metered && account.is_cold && tx_gas.spend(cold).is_err() {
-            return Ok(None);
-        }
-
-        owner = target;
-        disable_precompiles = true;
-    }
-    let mut code = Bytecode::default();
-    let mut code_chunk = None;
-    if account.code_size != Some(0) {
-        if let Some(target) = account.inline_delegation {
-            code = Bytecode::new_eip7702(target);
-        } else {
-            if tx_gas.spend(WARM_CODE_CHUNK_GAS).is_err() {
-                return Ok(None);
-            }
-            let cold_additional = COLD_CODE_CHUNK_GAS - WARM_CODE_CHUNK_GAS;
-            let skip_cold = tx_gas.remaining() < cold_additional;
-            let loaded = match Host::load_code_chunk(host, &owner, 0, skip_cold) {
-                Ok(Some(loaded)) => loaded,
-                Ok(None) => {
-                    return Err(crate::DatabaseError::new(
-                        crate::CodeChunkLoadError::Missing(account.code_hash),
-                        true,
-                    )
-                    .into());
-                }
-                Err(HostError::Halt(_)) => return Ok(None),
-                Err(HostError::Execution(error)) => return Err(error.into()),
-            };
-
-            if loaded.is_cold && tx_gas.spend(cold_additional).is_err() {
-                return Ok(None);
-            }
-            code_chunk = Some(loaded.chunk);
-        }
-    }
-    Ok(Some(InitialFrame {
-        charged_state_gas,
-        message: MessageExt {
-            kind: MessageKind::Call,
-            depth: 0,
-            gas_limit: tx_gas.remaining(),
-            reservoir: tx_gas.reservoir(),
-            destination: to,
-            call_target: to,
-            caller,
-            input: input.clone(),
-            value,
-            code: code_chunk.map_or_else(|| code.into(), CodeSource::Account),
-            code_hash: account.code_hash,
-            code_address: owner,
-            disable_precompiles,
-            caller_is_static: false,
-            salt: B256::ZERO,
-            ext: T::MessageExt::default(),
-            _non_exhaustive: (),
-        },
-    }))
+    Ok(loaded.chunk)
 }
 
 #[cfg(test)]

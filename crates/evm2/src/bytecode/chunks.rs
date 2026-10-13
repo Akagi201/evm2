@@ -310,21 +310,29 @@ pub const fn validate_code(code: &[u8]) -> Result<(), CodeChunkError> {
 
 /// Validates creation output and commits to the stored, modified chunk buffers.
 pub fn code_metadata(code: &[u8]) -> Result<Option<CodeMetadata>, CodeChunkError> {
+    prepare_code_chunks(&Bytes::copy_from_slice(code))
+        .map(|prepared| prepared.map(|(metadata, _)| metadata))
+}
+
+/// Prepares all runtime chunks and their commitments in one instruction scan.
+pub fn prepare_code_chunks(
+    code: &Bytes,
+) -> Result<Option<(CodeMetadata, Vec<CodeChunk>)>, CodeChunkError> {
     validate_code(code)?;
     if code.len() <= CODE_CHUNK_SIZE {
         return Ok(None);
     }
+    let count = code.len().div_ceil(CODE_CHUNK_SIZE);
+    let mut chunks = Vec::with_capacity(count);
+    let mut hashes = Vec::with_capacity(count);
+    let mut pc = 0;
+    for index in 0..count {
+        let chunk = prepare_code_chunk(code, index, &mut pc)?;
+        hashes.push(chunk.as_bytecode().hash_slow());
+        chunks.push(chunk);
+    }
     let last_chunk_size = ((code.len() - 1) % CODE_CHUNK_SIZE + 1) as u32;
-    let code = Bytes::copy_from_slice(code);
-    let hashes = (0..code.len().div_ceil(CODE_CHUNK_SIZE))
-        .map(|index| {
-            code_chunk(&code, index as u32)
-                .expect("validated chunk index")
-                .as_bytecode()
-                .hash_slow()
-        })
-        .collect();
-    CodeMetadata::new(last_chunk_size, hashes).map(Some)
+    Ok(Some((CodeMetadata::new(last_chunk_size, hashes)?, chunks)))
 }
 
 /// Prepares one chunk at creation or ingestion, without retaining its original slice.
@@ -336,34 +344,42 @@ pub fn code_chunk(code: &Bytes, index: u32) -> Option<CodeChunk> {
     if code.len() <= CODE_CHUNK_SIZE {
         return Some(CodeChunk::new(code.clone()));
     }
-    let end = start.checked_add(CODE_CHUNK_SIZE)?.min(code.len());
     let mut pc = 0;
     while pc < start {
         pc += instruction_len(code[pc]);
     }
-    let leading = pc.min(end).saturating_sub(start);
-    pc = pc.min(end);
-    while pc < end {
-        pc += instruction_len(code[pc]);
+    prepare_code_chunk(code, index as usize, &mut pc).ok()
+}
+
+fn prepare_code_chunk(
+    code: &Bytes,
+    index: usize,
+    pc: &mut usize,
+) -> Result<CodeChunk, CodeChunkError> {
+    let start = index * CODE_CHUNK_SIZE;
+    let end = (start + CODE_CHUNK_SIZE).min(code.len());
+    let leading = (*pc).min(end).saturating_sub(start);
+    *pc = (*pc).min(end);
+    while *pc < end {
+        *pc += instruction_len(code[*pc]);
     }
-    let mut bytes = code[start..pc.min(code.len())].to_vec();
-    bytes.resize(pc - start, 0);
-    bytes.extend_from_slice(&padding_suffix(pc - end));
-    if pc < code.len() {
+    let mut bytes = code[start..(*pc).min(code.len())].to_vec();
+    bytes.resize(*pc - start, 0);
+    bytes.extend_from_slice(&padding_suffix(*pc - end));
+    if *pc < code.len() {
         // The fixed padding and RJUMP width place the successor's logical start 35 bytes back.
         // The transfer handler then advances over that chunk's leading immediate data.
         bytes.push(op::RJUMP);
-        bytes.extend_from_slice(&encode_rjump_offset(-35).unwrap());
+        bytes.extend_from_slice(&encode_rjump_offset(-35).expect("fixed transfer offset"));
     } else {
         bytes.push(op::STOP);
     }
     bytes.push(leading as u8);
     CodeChunk::from_prepared(
-        Bytecode::new_chunk(bytes.into()).ok()?,
-        code.len().try_into().ok()?,
-        index,
+        Bytecode::new_chunk(bytes.into())?,
+        code.len().try_into().map_err(|_| CodeChunkError::CodeTooLarge)?,
+        index.try_into().map_err(|_| CodeChunkError::CodeTooLarge)?,
     )
-    .ok()
 }
 
 /// Checked aggregate incremental tariff for one operation.
@@ -507,6 +523,26 @@ fn padding_suffix(continuation_len: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_preparation_matches_individual_chunks_across_immediates() {
+        let mut code = alloc::vec![op::STOP; 3 * CODE_CHUNK_SIZE + 37];
+        code[CODE_CHUNK_SIZE - 1] = op::PUSH32;
+        code[2 * CODE_CHUNK_SIZE - 2] = op::RJUMP;
+        code[3 * CODE_CHUNK_SIZE - 1] = op::DUPN;
+        let code = Bytes::from(code);
+        let (metadata, chunks) = prepare_code_chunks(&code).unwrap().unwrap();
+
+        assert_eq!(chunks.len(), 4);
+        assert_eq!(chunks[1].start_offset(), 32);
+        assert_eq!(chunks[2].start_offset(), 1);
+        assert_eq!(chunks[3].start_offset(), 1);
+        for (index, chunk) in chunks.iter().enumerate() {
+            assert_eq!(chunk, &code_chunk(&code, index as u32).unwrap());
+            assert_eq!(metadata.chunk_hashes()[index], chunk.as_bytecode().hash_slow());
+            assert_eq!(chunk.payload_len(), metadata.chunk_len(index as u32).unwrap());
+        }
+    }
 
     #[test]
     fn metadata_last_chunk_size() {

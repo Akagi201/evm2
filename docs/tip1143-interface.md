@@ -20,7 +20,7 @@ Each prepared chunk has this stored format:
 
 A full chunk with a transfer occupies exactly 24 KiB. The final chunk may contain less original code. Ordinary legacy records are unchanged and have no trailer. Bytecode adds its usual in-memory safety padding separately; that safety padding is not stored or hashed.
 
-The complete logical code determines the account hash, code size, deposit gas, copy results and RPC output. Ordered chunk hashes commit to the complete stored buffers, including padding, generated tails and the offset byte. Creation or ingestion prepares the buffers before publication; `code_metadata` computes their commitments and `code_chunk(&Bytes, index)` derives one buffer from complete logical code.
+The complete logical code determines the account hash, code size, deposit gas, copy results and RPC output. Ordered chunk hashes commit to the complete stored buffers, including padding, generated tails and the offset byte. Creation or ingestion prepares the buffers before publication; `prepare_code_chunks(&Bytes)` returns all buffers and their commitments in one scan, while `code_chunk(&Bytes, index)` derives an individual buffer from complete logical code.
 
 `CodeChunk` owns one `Bytecode` plus scalar preparation context. Bytes, memory safety padding, jump analysis and the cached chunk hash belong to that Bytecode. There is no separate original-byte buffer or per-entry execution variant. `Bytecode::new_chunk(bytes)` validates the stored layout before adding safety padding and lazily analyzes jumps starting at the last stored byte’s offset. `CodeChunk::from_prepared(bytecode, code_size, index)` attaches and validates account context without copying bytes or repeating analysis; providers authenticate them against the account's commitments at ingestion.
 
@@ -79,6 +79,8 @@ Code ownership is split into three reusable layers:
 - `bytecode::CodeChunk` distinguishes a complete `Legacy(Bytecode)` record from a `Prepared(PreparedCodeChunk)` runtime slice. Only the prepared variant stores full runtime size and chunk index; payload length is derived from those fields. Account state and interpreter frames share these immutable buffers and their analysis.
 - `evm::state::CodeChunkHandle` loads account chunks and journals warmth. The database handles content hashes; account state handles addresses and indices.
 - `interpreter::InterpreterCode` owns the active `CodeSource`, cached borrowed view and PC. It centralizes account chunk activation and pointer lifetimes. Direct code uses its bytecode length; account chunks supply their runtime size, index and tail position.
+
+`CodeAccessMode` selects eager Ethereum loading or metered TIP-1143 loading from the active feature set. `AccountLoad::code_kind` classifies empty, legacy, delegated and chunked account code, and `code_source` uses that classification for both top-level and nested calls. The call paths retain their gas accounting and delegation-target access rules.
 
 Recursive calls have independent interpreter cursors. The account owns cached chunks and warmth, never an execution cursor. Returning a frame to the interpreter pool releases its code source.
 

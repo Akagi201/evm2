@@ -155,6 +155,9 @@ pub use system::{
 mod any;
 pub use any::NonStaticAny;
 
+mod account_code;
+pub(crate) use account_code::{AccountCodeKind, CodeAccessMode};
+
 pub mod bal;
 pub use bal::{
     AccountBal, AccountInfoBal, Bal, BalAccountLookup, BalChange, BalChanges, BalCodeChange,
@@ -1255,35 +1258,21 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         let mut gas = interp.gas();
         let output = if stop.is_success() {
             let mut output = Bytes::copy_from_slice(interp.output());
-            if let Err(stop) = self.validate_create_output(&mut gas, &mut output) {
-                self.state.rollback(checkpoint, self.features);
-                return Ok(MessageResultExt {
-                    stop,
-                    gas: *gas.tracker(),
-                    output: Bytes::new(),
-                    created_address: None,
-                    ext: T::MessageResultExt::default(),
-                    _non_exhaustive: (),
-                });
-            }
-
-            let metadata = if self.feature(EvmFeatures::TIP1143) {
-                // Validation above precedes deposit charging and publication.
-                crate::bytecode::code_metadata(&output).expect("validated creation output")
-            } else {
-                None
+            let prepared = match self.validate_create_output(&mut gas, &mut output) {
+                Ok(prepared) => prepared,
+                Err(stop) => {
+                    self.state.rollback(checkpoint, self.features);
+                    return Ok(MessageResultExt {
+                        stop,
+                        gas: *gas.tracker(),
+                        output: Bytes::new(),
+                        created_address: None,
+                        ext: T::MessageResultExt::default(),
+                        _non_exhaustive: (),
+                    });
+                }
             };
-            let prepared = metadata.as_ref().map(|metadata| {
-                (0..metadata.chunk_hashes().len())
-                    .map(|index| {
-                        (
-                            metadata.chunk_hashes()[index],
-                            crate::bytecode::code_chunk(&output, index as u32)
-                                .expect("validated original output has every prepared chunk"),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            });
+            let metadata = prepared.as_ref().map(|(metadata, _)| metadata.clone());
             if let Err(code) = self.state.account(address).map(|mut a| {
                 a.set_code_with_metadata(Bytecode::new_legacy(output.clone()), metadata);
             }) {
@@ -1291,8 +1280,8 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
                 return Err(code.into());
             }
 
-            if let Some(prepared) = prepared {
-                for (hash, chunk) in prepared {
+            if let Some((metadata, chunks)) = prepared {
+                for (hash, chunk) in metadata.chunk_hashes().iter().copied().zip(chunks) {
                     self.state.overlay_db_mut().cache.code_chunks.insert(hash, chunk.bytecode());
                 }
             }
@@ -1312,7 +1301,12 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         })
     }
 
-    fn validate_create_output(&self, gas: &mut Gas, output: &mut Bytes) -> Result<(), InstrStop> {
+    fn validate_create_output(
+        &self,
+        gas: &mut Gas,
+        output: &mut Bytes,
+    ) -> Result<Option<(crate::bytecode::CodeMetadata, Vec<crate::bytecode::CodeChunk>)>, InstrStop>
+    {
         if (self.feature(EvmFeatures::CODE_SIZE_CHECK) || self.feature(EvmFeatures::TIP1143))
             && output.len() > self.version().max_code_size
         {
@@ -1338,8 +1332,14 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
                 return Err(InstrStop::OutOfGas);
             }
             *output = Bytes::new();
-            return Ok(());
+            return Ok(None);
         }
+        let prepared = if self.feature(EvmFeatures::TIP1143) {
+            crate::bytecode::prepare_code_chunks(output)
+                .map_err(|_| InstrStop::InvalidImmediateEncoding)?
+        } else {
+            None
+        };
         gas.spend(code_deposit_gas)?;
 
         // EIP-8037: hashing the deployed bytecode to compute its code_hash costs
@@ -1354,7 +1354,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
                 gas.spend_state(code_deposit_state_gas)?;
             }
         }
-        Ok(())
+        Ok(prepared)
     }
 
     #[inline(never)]

@@ -4,6 +4,7 @@ use crate::{
     EvmFeatures, EvmTypesHost,
     bytecode::Bytecode,
     constants::CALL_DEPTH_LIMIT,
+    evm::CodeAccessMode,
     interpreter::{
         CodeSource, Gas, Host, InstrStop, InterpreterState, Message, MessageExt, MessageKind,
         Result, StackMut, Word, derive_create_destination,
@@ -87,22 +88,20 @@ fn load_acc_and_calc_gas<T: EvmTypesHost>(
     let additional_cold_cost = state.gas_params().cold_account_additional_cost();
     let remaining_gas = gas.remaining();
     let skip_cold_load = remaining_gas < additional_cold_cost;
-    let draft = state.feature(EvmFeatures::TIP1143);
+    let mode = CodeAccessMode::from_features(state.version().features);
     let mut account = state
         .host()
-        .load_account(&to, !draft, skip_cold_load)
+        .load_account(&to, mode.loads_full_code(), skip_cold_load)
         .map_err(|error| state.fail(error))?;
 
     let mut cost = 0;
     if account.is_cold {
         cost += additional_cold_cost;
     }
-    let mut code = account.code.clone();
     let mut code_address = to;
-    let delegation = if draft { account.inline_delegation } else { code.eip7702_address() };
     let mut disable_precompiles = false;
     if state.feature(EvmFeatures::EIP7702)
-        && let Some(delegated_address) = delegation
+        && let Some(delegated_address) = account.code_kind(mode).delegation_target()
     {
         cost += u64::from(state.gas_params().get(GasId::WarmStorageReadCost));
         if cost > remaining_gas {
@@ -111,12 +110,11 @@ fn load_acc_and_calc_gas<T: EvmTypesHost>(
         let skip_cold_load = remaining_gas < cost.saturating_add(additional_cold_cost);
         let delegated_account = state
             .host()
-            .load_account(&delegated_address, !draft, skip_cold_load)
+            .load_account(&delegated_address, mode.loads_full_code(), skip_cold_load)
             .map_err(|error| state.fail(error))?;
         if delegated_account.is_cold {
             cost += additional_cold_cost;
         }
-        code = delegated_account.code.clone();
         account = delegated_account;
 
         code_address = delegated_address;
@@ -143,15 +141,8 @@ fn load_acc_and_calc_gas<T: EvmTypesHost>(
     }
     gas.spend(cost)?;
     gas.spend_state(new_account_state_gas)?;
-    let mut code_chunk = None;
-    if draft && account.code_size != Some(0) {
-        if let Some(target) = account.inline_delegation {
-            // A delegation target is not followed recursively; synthesize its own marker.
-            code = Bytecode::new_eip7702(target);
-        } else {
-            code_chunk = Some(state.load_and_charge_code_chunk(gas, &code_address, 0)?);
-        }
-    }
+    let code =
+        account.code_source(mode, || state.load_and_charge_code_chunk(gas, &code_address, 0))?;
 
     let mut gas_limit = if state.feature(EvmFeatures::EIP150) {
         min(state.gas_params().call_stipend_reduction(gas.remaining()), stack_gas_limit)
@@ -167,12 +158,7 @@ fn load_acc_and_calc_gas<T: EvmTypesHost>(
     Ok((
         gas_limit,
         new_account_state_gas,
-        LoadedCode {
-            code: code_chunk.map_or_else(|| code.into(), CodeSource::Account),
-            code_hash: account.code_hash,
-            code_address,
-            disable_precompiles,
-        },
+        LoadedCode { code, code_hash: account.code_hash, code_address, disable_precompiles },
     ))
 }
 

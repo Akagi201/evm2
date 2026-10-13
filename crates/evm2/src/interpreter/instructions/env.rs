@@ -1,7 +1,7 @@
 use crate::{
-    EvmFeatures, EvmTypesHost,
+    EvmTypesHost,
     bytecode::{Bytecode, LEGACY_CODE_CHUNK_SIZE},
-    evm::AccountLoad,
+    evm::{AccountCodeKind, AccountLoad, CodeAccessMode},
     interpreter::{Gas, Host, InstrStop, Memory, Result, Word, private::GasInstructionCx},
     utils::{
         address_to_word, b256_to_word, word_to_address, word_to_usize, word_to_usize_saturated,
@@ -136,20 +136,18 @@ pub fn gasprice(cx: _) -> out {
 
 #[instruction(dynamic_gas)]
 pub fn extcodesize(cx: _, [addr]: [Word]) -> Result<out> {
-    let draft = cx.state.feature(EvmFeatures::TIP1143);
-    let account = load_account(&mut cx, *addr, !draft)?;
+    let mode = CodeAccessMode::from_features(cx.state.version().features);
+    let account = load_account(&mut cx, *addr, mode.loads_full_code())?;
 
-    let size = if !draft {
-        account.code.len()
-    } else if account.inline_delegation.is_some() {
-        23
-    } else if account.code_size == Some(0) {
-        0
-    } else if account.is_chunked {
-        account.code_size.expect("chunked size") as usize
-    } else {
-        let code_owner = word_to_address(*addr);
-        cx.state.load_and_charge_code_chunk(cx.gas, &code_owner, 0)?.payload_len()
+    let size = match (mode, account.code_kind(mode)) {
+        (CodeAccessMode::Eager, _) => account.code.len(),
+        (_, AccountCodeKind::Empty) => 0,
+        (_, AccountCodeKind::Delegated(_)) => 23,
+        (_, AccountCodeKind::Chunked { size }) => size as usize,
+        (_, AccountCodeKind::Legacy) => {
+            let code_owner = word_to_address(*addr);
+            cx.state.load_and_charge_code_chunk(cx.gas, &code_owner, 0)?.payload_len()
+        }
     };
     *out = Word::from(size);
 }
@@ -171,31 +169,31 @@ pub fn extcodecopy(cx: _, [addr, memory_offset, code_offset, len]: [Word]) -> Re
     } else {
         0
     };
-    let draft = cx.state.feature(EvmFeatures::TIP1143);
-    let account = load_account(&mut cx, *addr, !draft)?;
+    let mode = CodeAccessMode::from_features(cx.state.version().features);
+    let account = load_account(&mut cx, *addr, mode.loads_full_code())?;
 
-    if draft {
-        let bytes = if let Some(target) = account.inline_delegation {
-            let code = Bytecode::new_eip7702(target);
-            let source = word_to_usize_saturated(*code_offset);
-            code.original_byte_slice().get(source..).unwrap_or_default().to_vec()
-        } else if account.code_size == Some(0) {
-            Vec::new()
-        } else {
-            cx.state.load_code_range(
-                cx.gas,
-                word_to_address(*addr),
-                *code_offset,
-                len,
-                if account.is_chunked {
-                    account.code_size.expect("chunked size") as usize
-                } else {
-                    // Legacy reads charge chunk zero below the fixed limit, even if its
-                    // actual size is already cached. Residency must not change gas.
-                    LEGACY_CODE_CHUNK_SIZE
-                },
-                account.is_chunked,
-            )?
+    if mode == CodeAccessMode::MeteredChunks {
+        let bytes = match account.code_kind(mode) {
+            AccountCodeKind::Delegated(target) => {
+                let code = Bytecode::new_eip7702(target);
+                let source = word_to_usize_saturated(*code_offset);
+                code.original_byte_slice().get(source..).unwrap_or_default().to_vec()
+            }
+            AccountCodeKind::Empty => Vec::new(),
+            kind @ (AccountCodeKind::Legacy | AccountCodeKind::Chunked { .. }) => {
+                let (size, multi) = match kind {
+                    AccountCodeKind::Chunked { size } => (size as usize, true),
+                    _ => (LEGACY_CODE_CHUNK_SIZE, false),
+                };
+                cx.state.load_code_range(
+                    cx.gas,
+                    word_to_address(*addr),
+                    *code_offset,
+                    len,
+                    size,
+                    multi,
+                )?
+            }
         };
         cx.state.0.memory.set_data(memory_offset, 0, len, &bytes);
         return Ok(());
