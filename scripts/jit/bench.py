@@ -1024,8 +1024,12 @@ def runtime_per_iter(side: Side, bench: str) -> float:
     # `run <bench> 0` is what the compile-cost samples measure.
     samples = [i for i, _ in side.samples.get(bench, []) if i is not None]
     compile_only = statistics.median(samples) if samples else instructions(0)
-    probe = (instructions(100) - compile_only) / total_iters(100)
-    n = max(100, int(RUNTIME_TARGET / max(probe, 1)))
+    # Compile cost varies by about 0.3%, which can swamp a short probe and make it
+    # negative, so grow the probe until execution clearly dominates that noise.
+    n = 100
+    while (probe := instructions(n) - compile_only) < compile_only / 20 and n < 10**7:
+        n *= 10
+    n = max(100, int(RUNTIME_TARGET / max(probe / total_iters(n), 1)))
     return (instructions(n) - compile_only) / total_iters(n)
 
 
