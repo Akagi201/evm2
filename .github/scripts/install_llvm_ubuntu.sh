@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
-v=${1:-22}
+v=${1:-23}
 bins=(clang llvm-config lld ld.lld FileCheck)
 
 # Install prerequisites for llvm.sh.
