@@ -609,22 +609,10 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
             op::ADD => binop!(iadd),
             op::MUL => binop!(imul),
             op::SUB => binop!(isub),
-            op::DIV => {
-                let sp = self.sp_after_inputs();
-                let _ = self.call_builtin(Builtin::Div, &[sp]);
-            }
-            op::SDIV => {
-                let sp = self.sp_after_inputs();
-                let _ = self.call_builtin(Builtin::SDiv, &[sp]);
-            }
-            op::MOD => {
-                let sp = self.sp_after_inputs();
-                let _ = self.call_builtin(Builtin::Mod, &[sp]);
-            }
-            op::SMOD => {
-                let sp = self.sp_after_inputs();
-                let _ = self.call_builtin(Builtin::SMod, &[sp]);
-            }
+            op::DIV => self.build_div_rem(Builtin::Div, false, false),
+            op::SDIV => self.build_div_rem(Builtin::SDiv, true, false),
+            op::MOD => self.build_div_rem(Builtin::Mod, false, true),
+            op::SMOD => self.build_div_rem(Builtin::SMod, true, true),
             op::ADDMOD => {
                 let sp = self.sp_after_inputs();
                 let _ = self.call_builtin(Builtin::AddMod, &[sp]);
@@ -1269,6 +1257,81 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
             self.copy_stack_to_arg();
             self.save_stack_len();
         }
+    }
+
+    /// Builds `DIV`, `SDIV`, `MOD` or `SMOD`.
+    ///
+    /// Operands that fit in 64 bits, with a nonzero divisor, use a native 64-bit division.
+    /// Everything else calls the builtin on a cold path. `INT64_MIN / -1` takes the slow
+    /// path too, since its quotient doesn't fit.
+    fn build_div_rem(&mut self, builtin: Builtin, signed: bool, rem: bool) {
+        let fits = |c: U256| {
+            let magnitude = if signed && c.bit(255) { !c } else { c };
+            magnitude.bit_len() < 64 + usize::from(!signed)
+        };
+        if self.const_operands::<2>().into_iter().flatten().any(|c| !fits(c)) {
+            let sp = self.sp_after_inputs();
+            let _ = self.call_builtin(builtin, &[sp]);
+            return;
+        }
+
+        // The builtin reads `[b, a]` from here and writes the result over `b`.
+        let b_sp = self.sp_from_top(2);
+        let a_sp = self.sp_from_top(1);
+        let [a, b] = self.popn();
+
+        let i64_type = self.bcx.type_int(64);
+        let a64 = self.bcx.ireduce(i64_type, a);
+        let b64 = self.bcx.ireduce(i64_type, b);
+        let extend = |this: &mut Self, value| {
+            if signed {
+                this.bcx.sext(this.word_type, value)
+            } else {
+                this.bcx.zext(this.word_type, value)
+            }
+        };
+        let a_ext = extend(self, a64);
+        let b_ext = extend(self, b64);
+        let a_fits = self.bcx.icmp(IntCC::Equal, a, a_ext);
+        let b_fits = self.bcx.icmp(IntCC::Equal, b, b_ext);
+        let b_nonzero = self.bcx.icmp_imm(IntCC::NotEqual, b64, 0);
+        let mut fast = self.bcx.bitand(a_fits, b_fits);
+        fast = self.bcx.bitand(fast, b_nonzero);
+        if signed {
+            let a_not_min = self.bcx.icmp_imm(IntCC::NotEqual, a64, i64::MIN);
+            let b_not_neg_one = self.bcx.icmp_imm(IntCC::NotEqual, b64, -1);
+            let no_overflow = self.bcx.bitor(a_not_min, b_not_neg_one);
+            fast = self.bcx.bitand(fast, no_overflow);
+        }
+
+        let current = self.current_block();
+        let fast_block = self.create_block_after(current, "fast");
+        let slow_block = self.create_block_after(fast_block, "slow");
+        let done_block = self.create_block_after(slow_block, "contd");
+        // No weights: fixed-point math often divides operands wider than 64 bits.
+        self.bcx.brif(fast, fast_block, slow_block);
+
+        self.bcx.switch_to_block(fast_block);
+        let r64 = match (signed, rem) {
+            (false, false) => self.bcx.udiv(a64, b64),
+            (true, false) => self.bcx.sdiv(a64, b64),
+            (false, true) => self.bcx.urem(a64, b64),
+            (true, true) => self.bcx.srem(a64, b64),
+        };
+        let fast_result = extend(self, r64);
+        self.bcx.br(done_block);
+
+        self.bcx.switch_to_block(slow_block);
+        self.bcx.store(b, b_sp);
+        self.bcx.store(a, a_sp);
+        let _ = self.call_builtin(builtin, &[b_sp]);
+        let slow_result = self.load_word(b_sp, "div.slow");
+        self.bcx.br(done_block);
+
+        self.bcx.switch_to_block(done_block);
+        let result =
+            self.bcx.phi(self.word_type, &[(fast_result, fast_block), (slow_result, slow_block)]);
+        self.push(result);
     }
 
     /// Builds a `CREATE` or `CREATE2` instruction.
