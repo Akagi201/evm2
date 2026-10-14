@@ -712,6 +712,8 @@ tests! {
         div_zero_dividend(op::DIV, 0_U256, 42_U256 => 0_U256),
         div_by_zero1(op::DIV, 0_U256, 0_U256 => 0_U256),
         div_by_zero2(op::DIV, 32_U256, 0_U256 => 0_U256),
+        div_u64_max(op::DIV, 0xffffffffffffffff_U256, 3_U256 => 0x5555555555555555_U256),
+        div_above_u64(op::DIV, 0x10000000000000006_U256, 2_U256 => 0x8000000000000003_U256),
 
         rem1(op::MOD, 32_U256, 32_U256 => 0_U256),
         rem2(op::MOD, 1_U256, 2_U256 => 1_U256),
@@ -724,6 +726,8 @@ tests! {
         rem_zero_dividend(op::MOD, 0_U256, 42_U256 => 0_U256),
         rem_by_zero1(op::MOD, 0_U256, 0_U256 => 0_U256),
         rem_by_zero2(op::MOD, 32_U256, 0_U256 => 0_U256),
+        rem_u64_max(op::MOD, 0xffffffffffffffff_U256, 10_U256 => 5_U256),
+        rem_above_u64(op::MOD, 0x10000000000000007_U256, 0x10_U256 => 7_U256),
 
         sdiv1(op::SDIV, 32_U256, 32_U256 => 1_U256),
         sdiv2(op::SDIV, 1_U256, 2_U256 => 0_U256),
@@ -739,6 +743,10 @@ tests! {
         sdiv_by_int_min(op::SDIV, I256_MIN, I256_MIN => 1_U256),
         sdiv_nonmin_by_int_min(op::SDIV, 42_U256, I256_MIN => 0_U256),
         sdiv_zero_dividend(op::SDIV, 0_U256, 42_U256 => 0_U256),
+        sdiv_neg_dividend(op::SDIV, -7_U256, 2_U256 => -3_U256),
+        sdiv_neg_divisor(op::SDIV, 7_U256, -2_U256 => -3_U256),
+        sdiv_i64_min_by_minus_1(op::SDIV, -0x8000000000000000_U256, -1_U256 => 0x8000000000000000_U256),
+        sdiv_above_i64(op::SDIV, 0x8000000000000000_U256, -1_U256 => -0x8000000000000000_U256),
 
         srem1(op::SMOD, 32_U256, 32_U256 => 0_U256),
         srem2(op::SMOD, 1_U256, 2_U256 => 1_U256),
@@ -750,6 +758,9 @@ tests! {
         srem_zero_dividend(op::SMOD, 0_U256, 42_U256 => 0_U256),
         srem_by_zero1(op::SMOD, 0_U256, 0_U256 => 0_U256),
         srem_by_zero2(op::SMOD, 32_U256, 0_U256 => 0_U256),
+        srem_neg_dividend(op::SMOD, -7_U256, 2_U256 => -1_U256),
+        srem_neg_divisor(op::SMOD, 7_U256, -2_U256 => 1_U256),
+        srem_i64_min_by_minus_1(op::SMOD, -0x8000000000000000_U256, -1_U256 => 0_U256),
 
         addmod_mod_zero(op::ADDMOD, 1_U256, 2_U256, 0_U256 => 0_U256),
         addmod_mod_one(op::ADDMOD, 5_U256, 3_U256, 1_U256 => 0_U256),
