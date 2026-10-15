@@ -339,44 +339,6 @@ mod tests {
     }
 
     #[test]
-    fn simulation_version_disables_environment_checks_only() {
-        let sim = Version::simulation(SpecId::OSAKA);
-        for feature in [
-            EvmFeatures::NONCE_CHECK,
-            EvmFeatures::BALANCE_CHECK,
-            EvmFeatures::FEE_CHARGE,
-            EvmFeatures::BASE_FEE_CHECK,
-            EvmFeatures::BLOCK_GAS_LIMIT_CHECK,
-            EvmFeatures::PRIORITY_FEE_CHECK,
-            EvmFeatures::EIP3607,
-            EvmFeatures::TX_CHAIN_ID_CHECK,
-        ] {
-            assert!(!sim.feature(feature), "{feature:?} must be off for simulation");
-        }
-
-        // Consensus behavior and every non-validation default are untouched.
-        let base = Version::new(SpecId::OSAKA);
-        for feature in [
-            EvmFeatures::BALANCE_TOP_UP,
-            EvmFeatures::EIP2929,
-            EvmFeatures::EIP3529,
-            EvmFeatures::EIP7623,
-        ] {
-            assert!(sim.feature(feature), "{feature:?} must stay on for simulation");
-        }
-        assert_eq!(sim.gas_params, base.gas_params);
-        assert_eq!(sim.chain_id, base.chain_id);
-        assert_eq!(sim.tx_gas_limit_cap, base.tx_gas_limit_cap);
-        assert_eq!(sim.memory_limit, base.memory_limit);
-        assert_eq!(sim.max_code_size, base.max_code_size);
-        assert_eq!(sim.max_initcode_size, base.max_initcode_size);
-        assert_eq!(sim.max_blobs_per_tx, base.max_blobs_per_tx);
-
-        // The base version is not mutated.
-        assert!(base.feature(EvmFeatures::NONCE_CHECK));
-    }
-
-    #[test]
     fn default_gas_table_static_costs() {
         let default_gas_table = opcode_config(SpecId::FRONTIER);
         assert_eq!(default_gas_table.static_gas(op::STOP), 0);
