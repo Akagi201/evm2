@@ -830,11 +830,6 @@ impl<'a> State<'a> {
     /// selfdestruct resets (EIP-8246), or pre-EIP-161 empty-account materialization.
     pub(crate) fn finalize_transaction(&mut self, version: &Version) -> DbResult<()> {
         let selfdestructs = mem::take(&mut self.selfdestructs);
-        let touched: Vec<_> = self
-            .accounts
-            .iter()
-            .filter_map(|(&address, entry)| entry.is_touched.then_some(address))
-            .collect();
 
         let eip8246 = version.feature(EvmFeatures::EIP8246);
         for address in &selfdestructs {
@@ -852,22 +847,32 @@ impl<'a> State<'a> {
             self.storage(address)?.wipe();
         }
 
-        if version.feature(EvmFeatures::EIP161) {
-            for address in &touched {
-                // EIP-161 deletes touched dead accounts at transaction finalization.
-                let mut account = self.account(address)?;
-                if account.is_existing_dead() {
-                    account.delete_for_finalization();
-                    drop(account);
-                    self.storage(address)?.wipe();
-                }
+        // Finalization never touches accounts, so clearing touches in the same pass that selects
+        // the touched accounts to finalize sees the same set. Only those accounts need another
+        // lookup, and they are rare.
+        let eip161 = version.feature(EvmFeatures::EIP161);
+        let mut finalize = Vec::new();
+        for (&address, entry) in &mut self.accounts {
+            if !mem::take(&mut entry.is_touched) {
+                continue;
             }
-        } else {
-            for address in &touched {
-                // Before EIP-161, touching a non-existent account materializes it as empty.
-                if !selfdestructs.contains(address) && !self.account(address)?.exists() {
-                    self.materialize_empty_account_for_finalization(address)?;
-                }
+            // EIP-161 deletes touched dead accounts at transaction finalization. Before EIP-161,
+            // touching a non-existent account materializes it as empty.
+            let needs_finalization = if eip161 {
+                entry.is_existing_dead()
+            } else {
+                entry.present.is_none() && !selfdestructs.contains(&address)
+            };
+            if needs_finalization {
+                finalize.push(address);
+            }
+        }
+        for address in &finalize {
+            if eip161 {
+                self.account(address)?.delete_for_finalization();
+                self.storage(address)?.wipe();
+            } else {
+                self.materialize_empty_account_for_finalization(address)?;
             }
         }
 
@@ -875,12 +880,6 @@ impl<'a> State<'a> {
         // detached [`PendingState`] to flag selfdestructed accounts, and `clear_transaction_state`
         // clears it at the end of the transaction lifecycle.
         self.selfdestructs = selfdestructs;
-
-        for address in touched {
-            if let Some(entry) = self.accounts.get_mut(&address) {
-                entry.is_touched = false;
-            }
-        }
         Ok(())
     }
 
