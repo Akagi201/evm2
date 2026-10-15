@@ -105,9 +105,10 @@ pub(super) struct FunctionCx<'a, B: Backend> {
     /// Cumulative stack diff from the section start to the current instruction (compile-time).
     /// Updated after the opcode handler so that push/pop/sp helpers see the pre-diff value.
     section_len_offset: i32,
-    /// The cumulative offset that `len.addr` currently holds relative to `section_start_len`.
-    /// At section start this is 0 (len.addr == section_start_len). After each store it becomes
-    /// `section_len_offset + diff`. Stores are skipped when the new offset matches this value.
+    /// The cumulative offset that `stack_len.addr` currently holds relative to
+    /// `section_start_len`. At section start this is 0 (`stack_len.addr == section_start_len`).
+    /// After each store it becomes `section_len_offset + diff`. Stores are skipped when the new
+    /// offset matches this value.
     stored_len_offset: i32,
     cached_mem_base: Option<B::Value>,
 
@@ -204,7 +205,7 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
 
         let stack_len_arg = bcx.fn_param(2);
         // This is initialized later in `post_entry_block`.
-        let stack_len = bcx.new_stack_slot(isize_type, "len.addr");
+        let stack_len = bcx.new_stack_slot(isize_type, "stack_len.addr");
 
         // Create all instruction entry blocks. Dead-code instructions map to
         // `unreachable_block`; dedup redirects are resolved at control-flow callsites.
@@ -501,7 +502,7 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
             goto_return!("noop");
         }
 
-        // Store the updated stack length. Skip when `len.addr` already holds the
+        // Store the updated stack length. Skip when `stack_len.addr` already holds the
         // correct value, i.e. the offset we'd write matches what's already stored.
         let new_len_offset = self.section_len_offset + diff;
         if new_len_offset != self.stored_len_offset {
@@ -575,16 +576,25 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
 
         /// Gets the pointer to a field via chained `offset_of!`.
         macro_rules! field {
-            // Gets the pointer to a field.
-            (@get $base:expr, $($paths:path),*; $($spec:tt).*) => {
-                self.get_field($base, 0 $(+ mem::offset_of!($paths, $spec))*, stringify!($($spec).*.addr))
+            // Gets the pointer to a field, named `<base>.<field>.addr`.
+            (@get $base:ident, $($paths:path),*; $($spec:tt).*) => {
+                self.get_field(
+                    $base,
+                    0 $(+ mem::offset_of!($paths, $spec))*,
+                    concat!(stringify!($base), ".", stringify!($($spec).*), ".addr"),
+                )
             };
             // Loads a field.
             // `@[endian]` is the endianness of the stored value. If native, omit it.
-            (@load $(@[endian = $endian:tt])? $ty:expr, $base:expr, $($paths:path),*; $($spec:tt).*) => {{
+            (@load $(@[endian = $endian:tt])? $ty:expr, $base:ident, $($paths:path),*; $($spec:tt).*) => {{
                 let ptr = field!(@get $base, $($paths),*; $($spec).*);
                 #[allow(unused_mut)]
-                let mut value = self.bcx.load_aligned($ty, ptr, 1, stringify!($($spec).*));
+                let mut value = self.bcx.load_aligned(
+                    $ty,
+                    ptr,
+                    1,
+                    concat!(stringify!($base), ".", stringify!($($spec).*)),
+                );
                 $(
                     if !cfg!(target_endian = $endian) {
                         value = self.bcx.bswap(value);
@@ -594,7 +604,7 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
             }};
             // Loads, extends (if necessary), and pushes a field.
             // `@[endian]` is the endianness of the stored value. If native, omit it.
-            (@push $(@[endian = $endian:tt])? $ty:expr, $base:expr, $($rest:tt)*) => {{
+            (@push $(@[endian = $endian:tt])? $ty:expr, $base:ident, $($rest:tt)*) => {{
                 let mut value = field!(@load $(@[endian = $endian])? $ty, $base, $($rest)*);
                 if self.bcx.type_bit_width($ty) < 256 {
                     value = self.bcx.zext(self.word_type, value);
@@ -742,7 +752,8 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
                 let _ = self.call_builtin(Builtin::CallDataLoad, &[self.ecx, sp]);
             }
             op::CALLDATASIZE => {
-                field!(@push self.isize_type, self.ecx, EvmContext<'_, '_, '_>; calldatasize);
+                let ecx = self.ecx;
+                field!(@push self.isize_type, ecx, EvmContext<'_, '_, '_>; calldatasize);
             }
             op::CALLDATACOPY => {
                 let sp = self.sp_after_inputs();
@@ -770,7 +781,8 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
                 self.call_fallible_builtin(Builtin::ExtCodeCopy, &[self.ecx, sp]);
             }
             op::RETURNDATASIZE => {
-                field!(@push self.isize_type, self.ecx, EvmContext<'_, '_, '_>; return_data_len);
+                let ecx = self.ecx;
+                field!(@push self.isize_type, ecx, EvmContext<'_, '_, '_>; return_data_len);
             }
             op::RETURNDATACOPY => {
                 let sp = self.sp_after_inputs();
@@ -963,7 +975,7 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
             op::GAS => {
                 let addr = self.gas_remaining_addr();
                 let i64_type = self.bcx.type_int(64);
-                let remaining = self.bcx.load(i64_type, addr, "gas.remaining");
+                let remaining = self.bcx.load(i64_type, addr, "ecx.gas.remaining");
                 let remaining = self.bcx.zext(self.word_type, remaining);
                 self.push(remaining);
             }
@@ -1331,8 +1343,7 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
 
     fn gas_remaining_addr(&mut self) -> B::Value {
         const OFFSET: usize = mem::offset_of!(EvmContext<'_, '_, '_>, gas);
-        let offset = self.bcx.iconst(self.isize_type, OFFSET as i64);
-        self.bcx.gep(self.i8_type, self.ecx, &[offset], "gas.remaining.addr")
+        self.get_field(self.ecx, OFFSET, "ecx.gas.remaining.addr")
     }
 
     /// Saves the local `stack_len` to `stack_len_arg`.
@@ -1541,7 +1552,7 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
         // This can overflow the gas counters, which has to be adjusted for after the call.
         let addr = self.gas_remaining_addr();
         let i64_type = self.bcx.type_int(64);
-        let gas_remaining = self.bcx.load(i64_type, addr, "gas.remaining");
+        let gas_remaining = self.bcx.load(i64_type, addr, "ecx.gas.remaining");
         let (res, overflow) = self.bcx.usub_overflow(gas_remaining, cost);
         self.bcx.store(res, addr);
         self.build_check(overflow, InstrStop::OutOfGas);
@@ -1963,6 +1974,10 @@ mod pf {
 }
 
 fn get_field<B: Builder>(bcx: &mut B, ptr: B::Value, offset: usize, name: &str) -> B::Value {
+    // A field at offset 0 is `ptr` itself; a zero GEP would only clutter the IR.
+    if offset == 0 {
+        return ptr;
+    }
     let offset = bcx.iconst(bcx.type_ptr_sized_int(), offset as i64);
     bcx.gep(bcx.type_int(8), ptr, &[offset], name)
 }
