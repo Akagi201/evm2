@@ -701,6 +701,20 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         self.database_mut().downcast_mut()
     }
 
+    /// Consumes the EVM and returns the current backing database, dropping all execution state.
+    ///
+    /// This is the consuming counterpart to [`Self::database`]. Unlike
+    /// [`Self::database_as_mut`] it needs neither a `'static` bound nor a downcast, so it also
+    /// works for databases that borrow. The in-memory layers — accepted state, the journal, and
+    /// transaction scratch — are never written through to the database, so nothing the EVM
+    /// executed reaches it. The database itself is returned as-is and may differ from the one
+    /// passed to the constructor: it can be replaced through [`Self::set_database`], mutated
+    /// through [`Self::database_mut`], or changed by its own reads.
+    #[inline]
+    pub fn into_db(self) -> Box<dyn DynDatabase + 'a> {
+        self.state.into_db()
+    }
+
     /// Returns the mutable EVM state.
     #[inline]
     pub const fn state(&self) -> &State<'a> {
@@ -4188,6 +4202,37 @@ mod tests {
         );
 
         let _ = evm.transact(&test_tx(0));
+    }
+
+    #[test]
+    fn into_db_returns_the_backing_database() {
+        let evm = lifecycle_evm();
+        let mut db = evm.into_db();
+        let db = db.downcast_mut::<InMemoryDB>().expect("the backing database");
+        assert_eq!(
+            db.account_info(&LIFECYCLE_ACCOUNT).map(|info| info.balance),
+            Some(Word::from(1))
+        );
+    }
+
+    #[test]
+    fn into_db_returns_the_replacement_after_set_database() {
+        let mut evm = lifecycle_evm();
+        let replacement_account = Address::with_last_byte(0x7b);
+        let mut database = InMemoryDB::default();
+        database.insert_account_info(
+            &replacement_account,
+            AccountInfo::default().with_balance(Word::from(2)),
+        );
+        evm.set_database(database);
+
+        let mut db = evm.into_db();
+        let db = db.downcast_mut::<InMemoryDB>().expect("the backing database");
+        assert!(db.account_info(&LIFECYCLE_ACCOUNT).is_none());
+        assert_eq!(
+            db.account_info(&replacement_account).map(|info| info.balance),
+            Some(Word::from(2))
+        );
     }
 
     #[test]

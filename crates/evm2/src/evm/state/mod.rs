@@ -212,6 +212,19 @@ impl<'a> State<'a> {
         self.clear_transaction_state();
     }
 
+    /// Consumes the state and returns the current backing database, dropping every in-memory
+    /// layer.
+    ///
+    /// The in-memory layers — accepted state, the journal, and transaction scratch — are never
+    /// written through to the database, so nothing the EVM executed reaches it. The database
+    /// itself is returned as-is and may differ from the one passed to [`Self::new`]: it can be
+    /// replaced through [`Self::set_initial`], mutated through [`Self::initial_mut`], or
+    /// changed by its own reads.
+    #[inline]
+    pub fn into_db(self) -> Box<dyn DynDatabase + 'a> {
+        self.inner.database.db
+    }
+
     /// Returns the accepted-state overlay database.
     #[inline]
     pub fn overlay_db(&self) -> &CacheDB<Box<dyn DynDatabase + 'a>> {
