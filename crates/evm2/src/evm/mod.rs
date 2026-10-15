@@ -949,9 +949,14 @@ impl<'a, T: EvmTypes<Tx: Typed2718>> Evm<'a, T> {
     /// [`ExecutedTx::detach`] before
     /// another transaction can be executed. Dropping the handle is equivalent to
     /// [`ExecutedTx::discard`].
+    ///
+    /// Transaction handlers cannot modify the inspector, precompile provider, interpreter runner,
+    /// or execution configuration while the transaction is being executed.
     pub fn transact(&mut self, tx: &Recovered<T::Tx>) -> HandlerResult<ExecutedTx<'_, 'a, T>> {
         let handler = self.registry.try_get_by_type(tx.ty())?;
-        let result = handler.execute(tx, self);
+        let guard = self.enter_execution();
+        let result = handler.execute(tx, guard.evm);
+        drop(guard);
         match result {
             Ok(result) => self.finish_executed_tx(result),
             Err(err) => {
@@ -4089,5 +4094,121 @@ mod tests {
                 Word::from(1)
             );
         }
+    }
+
+    #[rstest::rstest]
+    #[case(InspectorAccess::Mut)]
+    #[case(InspectorAccess::Set)]
+    #[case(InspectorAccess::SetBoxed)]
+    #[case(InspectorAccess::Clear)]
+    #[should_panic(expected = "inspector cannot be modified during EVM execution")]
+    fn inspector_mutation_panics_during_transact(#[case] access: InspectorAccess) {
+        let mut evm = lifecycle_evm();
+        evm.set_inspector(NoopInspector::default());
+        evm.registry.register(
+            TEST_TX_TYPE,
+            TxEnvelope::as_legacy,
+            handler(
+                |_| Ok(()),
+                move |req: TxRequest<'_, '_, BaseEvmTypes, TxLegacy>, ()| {
+                    match access {
+                        InspectorAccess::Mut => {
+                            let _ = req.host.inspector_mut();
+                        }
+                        InspectorAccess::Set => req.host.set_inspector(NoopInspector::default()),
+                        InspectorAccess::SetBoxed => {
+                            req.host.set_boxed_inspector(Box::<NoopInspector>::default());
+                        }
+                        InspectorAccess::Clear => {
+                            let _ = req.host.clear_inspector();
+                        }
+                    }
+                    Ok(TxResultExt::default())
+                },
+            ),
+        );
+
+        let _ = evm.transact(&test_tx(0));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn transact_restores_inspector_access_after_success_error_and_panic() {
+        let mut evm = lifecycle_evm();
+        evm.registry.register(
+            TEST_TX_TYPE,
+            TxEnvelope::as_legacy,
+            handler(
+                |_| Ok(()),
+                |req: TxRequest<'_, '_, BaseEvmTypes, TxLegacy>, ()| match req.tx.nonce {
+                    0 => Ok(TxResultExt::default()),
+                    1 => Err(HandlerError::InsufficientFunds),
+                    _ => panic!("transaction handler panicked"),
+                },
+            ),
+        );
+
+        for nonce in 0..3 {
+            evm.set_inspector(NoopInspector::default());
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                evm.call_tx(&test_tx(nonce))
+            }));
+            match nonce {
+                0 => assert!(result.unwrap().is_ok()),
+                1 => assert_eq!(result.unwrap().unwrap_err(), HandlerError::InsufficientFunds),
+                _ => assert!(result.is_err()),
+            }
+            assert!(evm.clear_inspector_as::<NoopInspector>().is_some());
+            evm.set_precompiles(empty_precompiles());
+        }
+    }
+
+    #[rstest::rstest]
+    #[case(PrecompileAccess::Mut)]
+    #[case(PrecompileAccess::Set)]
+    #[should_panic(expected = "precompile provider cannot be modified during EVM execution")]
+    fn precompiles_cannot_be_modified_during_transact(#[case] access: PrecompileAccess) {
+        let mut evm = lifecycle_evm();
+        evm.registry.register(
+            TEST_TX_TYPE,
+            TxEnvelope::as_legacy,
+            handler(
+                |_| Ok(()),
+                move |req: TxRequest<'_, '_, BaseEvmTypes, TxLegacy>, ()| {
+                    match access {
+                        PrecompileAccess::Mut => {
+                            let _ = req.host.precompiles_mut();
+                        }
+                        PrecompileAccess::Set => req.host.set_precompiles(empty_precompiles()),
+                        PrecompileAccess::AsMut => unreachable!(),
+                    }
+                    Ok(TxResultExt::default())
+                },
+            ),
+        );
+
+        let _ = evm.transact(&test_tx(0));
+    }
+
+    #[test]
+    #[should_panic(expected = "inspector cannot be modified during EVM execution")]
+    fn nested_transact_preserves_inspector_guard() {
+        let mut evm = lifecycle_evm();
+        evm.registry.register(
+            TEST_TX_TYPE,
+            TxEnvelope::as_legacy,
+            handler(
+                |_| Ok(()),
+                |req: TxRequest<'_, '_, BaseEvmTypes, TxLegacy>, ()| {
+                    if req.tx.nonce == 0 {
+                        let _ = req.host.call_tx(&test_tx(1))?;
+                        req.host.set_inspector(NoopInspector::default());
+                    }
+                    Ok(TxResultExt::default())
+                },
+            ),
+        );
+
+        let _ = evm.transact(&test_tx(0));
     }
 }
