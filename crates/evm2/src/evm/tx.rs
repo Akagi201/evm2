@@ -114,6 +114,22 @@ impl<E> TxResultExt<E> {
     pub const fn state_gas_spent(&self) -> u64 {
         self.state_gas_spent
     }
+
+    /// Returns the effective gas refund after the EIP-7623 floor adjustment.
+    ///
+    /// [`Self::refunded`] is capped per EIP-3529 but still pre-floor. When the floor binds —
+    /// `total_gas_spent - refunded < floor_gas` — the floor charge absorbs the refund entirely
+    /// and this returns zero; otherwise it returns [`Self::refunded`]. Consumers computing net
+    /// cost as `total_gas_spent - refund` should use this rather than the raw field; the receipt
+    /// value is [`Self::tx_gas_used`].
+    #[inline]
+    pub const fn final_refunded(&self) -> u64 {
+        if self.total_gas_spent.saturating_sub(self.refunded) < self.floor_gas {
+            0
+        } else {
+            self.refunded
+        }
+    }
 }
 
 /// Whether the transaction scratch is still pending resolution. Not the owned
@@ -361,5 +377,23 @@ mod tests {
         // Floor active: spent - refunded < floor, so floor wins.
         let r = result(50_000, 0, 40_000, 21_000);
         assert_eq!(r.tx_gas_used(), 21_000);
+    }
+
+    #[test]
+    fn final_refunded_tracks_the_floor() {
+        // Floor inactive: the full EIP-3529-capped refund is effective.
+        let r = result(100_000, 30_000, 8_000, 21_000);
+        assert_eq!(r.final_refunded(), 8_000);
+        assert_eq!(r.total_gas_spent - r.final_refunded(), r.tx_gas_used());
+
+        // Floor binds: spent - refunded < floor, so the refund is absorbed.
+        let r = result(50_000, 0, 40_000, 21_000);
+        assert_eq!(r.final_refunded(), 0);
+        assert_eq!(r.tx_gas_used(), r.floor_gas);
+
+        // Boundary: the refund survives when it exactly reaches the floor.
+        let r = result(50_000, 0, 29_000, 21_000);
+        assert_eq!(r.final_refunded(), 29_000);
+        assert_eq!(r.total_gas_spent - r.final_refunded(), r.tx_gas_used());
     }
 }
