@@ -1,4 +1,9 @@
 //! BN254 precompile implementation using herumi/mcl via [`mcl_rust`].
+//!
+//! mcl is fastest on x86-64 CPUs with AVX, BMI2, and ADX, where it JIT-compiles its field
+//! arithmetic with `mulx`, `adcx`, and `adox`; this cuts pairing time by about 40%. Without
+//! these features, including under emulators that do not report ADX such as valgrind, mcl runs
+//! generic code that is slower but still faster than the arkworks backend.
 
 use super::{Bn254Ops, FQ_LEN, FQ2_LEN, G1_LEN, SCALAR_LEN};
 use crate::precompiles::PrecompileHalt;
