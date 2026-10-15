@@ -55,7 +55,8 @@ pub const LOOP_ITERATION_LIMIT: u64 = 200_000;
 /// The recursion limit for function calls.
 ///
 /// Once exceeded, the function will throw an error.
-pub const RECURSION_LIMIT: usize = 10_000;
+/// Kept below Boa's default because recursive accessors also consume native stack space.
+pub const RECURSION_LIMIT: usize = 128;
 
 /// Reused pre-execution data for one call depth. Parents remain pending during child execution.
 #[derive(Debug, Default)]
@@ -279,7 +280,8 @@ impl JsInspector {
 
     /// Applies the runtime limits to the JS context.
     ///
-    /// By default
+    /// Increasing the recursion limit can overflow the native stack when tracing code uses
+    /// recursive property accessors.
     pub fn set_runtime_limits(&mut self, limits: RuntimeLimits) {
         self.ctx.set_runtime_limits(limits);
     }
@@ -312,24 +314,25 @@ impl JsInspector {
         let TxResultWithState { result, pending_state, .. } = res;
         let state = TxState::from_pending(pending_state);
 
-        let mut to = None;
         let mut output_bytes = None;
         let mut error = None;
 
         if result.status {
-            to = result.created_address;
             output_bytes = Some(result.output.clone());
         } else if result.stop.is_revert() {
             error = Some("execution reverted".to_string());
             output_bytes = Some(result.output.clone());
         } else {
-            error = Some(format!("execution halted: {:?}", result.stop));
+            error = utils::fmt_error_msg(result.stop, TraceStyle::Geth);
         }
 
         let kind = tx.kind();
-        if let TxKind::Call(target) = kind {
-            to = Some(target);
-        }
+        let to = Some(match kind {
+            TxKind::Call(target) => target,
+            TxKind::Create => {
+                result.created_address.unwrap_or_else(|| tx.signer().create(tx.nonce()))
+            }
+        });
 
         let base_fee = block.basefee.try_into().unwrap_or(u64::MAX);
 
@@ -923,12 +926,13 @@ mod tests {
     use alloc::{string::ToString, vec, vec::Vec};
     use alloy_consensus::{TxLegacy, transaction::Recovered};
     use alloy_primitives::{Address, Bytes, TxKind, U256, bytes, hex};
+    use boa_engine::error::{EngineError, RuntimeLimitError};
     use evm2::{
-        BaseEvmTypes, Evm, Precompiles, SpecId,
+        BaseEvmTypes, Evm, Precompiles, SpecId, Version,
         bytecode::Bytecode,
-        ethereum::{TxEnvelope, ethereum_tx_registry},
+        ethereum::{TxEnvelope, ethereum_tx_registry, floor_gas, intrinsic_gas},
         evm::{AccountInfo, CacheDB, EmptyDB},
-        interpreter::Host,
+        interpreter::{Host, op},
     };
     use serde_json::json;
 
@@ -1621,5 +1625,97 @@ mod tests {
         assert_eq!(obj["stackPeek"], json!("1"));
         assert_eq!(obj["value"], json!("0"));
         assert_eq!(obj["balance"], json!("0"));
+    }
+
+    #[test]
+    fn test_runtime_limits() {
+        let inspector = JsInspector::new(
+            "{fault: function() {}, result: function() {}}".into(),
+            serde_json::Value::Null,
+        )
+        .unwrap();
+        assert_eq!(inspector.ctx.runtime_limits().recursion_limit(), RECURSION_LIMIT);
+        assert_eq!(inspector.ctx.runtime_limits().loop_iteration_limit(), LOOP_ITERATION_LIMIT);
+    }
+
+    #[test]
+    fn test_accessor_recursion_limit() {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                for setup in [
+                    "const obj = {get x() {return this.x;}}; obj.x;",
+                    "const obj = {set x(value) {this.x = value;}}; obj.x = 1;",
+                    "async function* f() {} f().return({get then() {this.then;}});",
+                ] {
+                    let code = format!(
+                        "{{setup: function() {{{setup}}}, fault: function() {{}}, result: function() {{}}}}"
+                    );
+                    let error = JsInspector::new(code, serde_json::Value::Null).unwrap_err();
+                    let JsInspectorError::SetupCallFailed(error) = error else {
+                        panic!("unexpected error: {error}");
+                    };
+                    assert!(matches!(
+                        error.as_engine(),
+                        Some(EngineError::RuntimeLimit(RuntimeLimitError::Recursion))
+                    ));
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_create_context_to_on_success_revert_halt_and_runtime_oog() {
+        for (spec, initcode, runtime_oog) in [
+            (SpecId::PRAGUE, Bytes::from_static(&[op::STOP]), false),
+            (SpecId::PRAGUE, Bytes::from_static(&[op::PUSH0, op::PUSH0, op::REVERT]), false),
+            (SpecId::PRAGUE, Bytes::from_static(&[op::INVALID]), false),
+            (SpecId::AMSTERDAM, Bytes::from_static(&[op::STOP]), true),
+        ] {
+            let caller = Address::repeat_byte(0xaa);
+            let nonce = 7;
+            let mut db = CacheDB::new(EmptyDB::default());
+            db.insert_account_info(&caller, AccountInfo { nonce, ..AccountInfo::default() });
+            let script = r#"{
+                fault: function() {},
+                result: function(ctx) { return toHex(ctx.to); }
+            }"#;
+            let inspector = JsInspector::new(script.to_string(), serde_json::Value::Null).unwrap();
+            let mut evm = Evm::<BaseEvmTypes>::new(
+                spec,
+                evm2::env::BlockEnvExt::default(),
+                ethereum_tx_registry(spec),
+                db,
+                Precompiles::base(spec),
+            );
+            evm.set_inspector(inspector);
+            let gas_limit = if runtime_oog {
+                let version = Version::base(spec);
+                intrinsic_gas(version, caller, TxKind::Create, &initcode, 0, 0, U256::ZERO)
+                    .max(floor_gas(version, caller, TxKind::Create, &initcode, 0, 0, U256::ZERO))
+            } else {
+                100_000
+            };
+            let tx = Recovered::new_unchecked(
+                TxEnvelope::Legacy(TxLegacy {
+                    nonce,
+                    gas_limit,
+                    to: TxKind::Create,
+                    input: initcode,
+                    ..TxLegacy::default()
+                }),
+                caller,
+            );
+            let result = evm.transact(&tx).unwrap().detach();
+            if runtime_oog {
+                assert_eq!(result.result.stop, InstrStop::OutOfGas);
+            }
+            let mut inspector = evm.clear_inspector_as::<JsInspector>().unwrap();
+            let block = *evm.block_env();
+            let traced = inspector.json_result(&result, &tx, &block, evm.database_mut()).unwrap();
+            assert_eq!(traced, json!(format!("{:#x}", caller.create(nonce))));
+        }
     }
 }
