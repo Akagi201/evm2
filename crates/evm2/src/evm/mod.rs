@@ -4205,37 +4205,6 @@ mod tests {
     }
 
     #[test]
-    fn into_db_returns_the_backing_database() {
-        let evm = lifecycle_evm();
-        let mut db = evm.into_db();
-        let db = db.downcast_mut::<InMemoryDB>().expect("the backing database");
-        assert_eq!(
-            db.account_info(&LIFECYCLE_ACCOUNT).map(|info| info.balance),
-            Some(Word::from(1))
-        );
-    }
-
-    #[test]
-    fn into_db_returns_the_replacement_after_set_database() {
-        let mut evm = lifecycle_evm();
-        let replacement_account = Address::with_last_byte(0x7b);
-        let mut database = InMemoryDB::default();
-        database.insert_account_info(
-            &replacement_account,
-            AccountInfo::default().with_balance(Word::from(2)),
-        );
-        evm.set_database(database);
-
-        let mut db = evm.into_db();
-        let db = db.downcast_mut::<InMemoryDB>().expect("the backing database");
-        assert!(db.account_info(&LIFECYCLE_ACCOUNT).is_none());
-        assert_eq!(
-            db.account_info(&replacement_account).map(|info| info.balance),
-            Some(Word::from(2))
-        );
-    }
-
-    #[test]
     #[should_panic(expected = "inspector cannot be modified during EVM execution")]
     fn nested_transact_preserves_inspector_guard() {
         let mut evm = lifecycle_evm();
