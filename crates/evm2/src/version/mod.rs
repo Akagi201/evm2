@@ -62,6 +62,34 @@ impl Version {
         &BASE_VERSIONS[spec_id as usize]
     }
 
+    /// Creates the base EVM version for `spec_id` with transaction-environment validation
+    /// disabled, for `eth_call`-style simulation.
+    ///
+    /// Removes the checks that reject a transaction for environment reasons rather than
+    /// execution behavior: [`EvmFeatures::NONCE_CHECK`], [`EvmFeatures::BALANCE_CHECK`],
+    /// [`EvmFeatures::FEE_CHARGE`], [`EvmFeatures::BASE_FEE_CHECK`],
+    /// [`EvmFeatures::BLOCK_GAS_LIMIT_CHECK`], [`EvmFeatures::PRIORITY_FEE_CHECK`],
+    /// [`EvmFeatures::EIP3607`], and [`EvmFeatures::TX_CHAIN_ID_CHECK`]. Everything else —
+    /// gas schedules, EIP-2929 warmth, refund caps, code size limits — keeps the `spec_id`
+    /// defaults, so execution failures are still reported; only the on-chain preconditions
+    /// stop being enforced. Consensus validation uses [`Self::new`].
+    ///
+    /// [`EvmFeatures::BALANCE_TOP_UP`] stays enabled, so a sender that cannot pay costs is
+    /// topped up instead of failing, which is what a node does for `eth_call`.
+    #[inline]
+    pub const fn simulation(spec_id: SpecId) -> Self {
+        let mut version = Self::new(spec_id);
+        version.features.remove(EvmFeatures::NONCE_CHECK);
+        version.features.remove(EvmFeatures::BALANCE_CHECK);
+        version.features.remove(EvmFeatures::FEE_CHARGE);
+        version.features.remove(EvmFeatures::BASE_FEE_CHECK);
+        version.features.remove(EvmFeatures::BLOCK_GAS_LIMIT_CHECK);
+        version.features.remove(EvmFeatures::PRIORITY_FEE_CHECK);
+        version.features.remove(EvmFeatures::EIP3607);
+        version.features.remove(EvmFeatures::TX_CHAIN_ID_CHECK);
+        version
+    }
+
     /// Returns `true` if the active feature set contains `feature`.
     #[inline]
     pub const fn feature(&self, feature: EvmFeatures) -> bool {
@@ -308,6 +336,44 @@ mod tests {
 
         let prague = Version::base(SpecId::PRAGUE);
         assert_eq!(prague.max_blobs_per_tx, 9);
+    }
+
+    #[test]
+    fn simulation_version_disables_environment_checks_only() {
+        let sim = Version::simulation(SpecId::OSAKA);
+        for feature in [
+            EvmFeatures::NONCE_CHECK,
+            EvmFeatures::BALANCE_CHECK,
+            EvmFeatures::FEE_CHARGE,
+            EvmFeatures::BASE_FEE_CHECK,
+            EvmFeatures::BLOCK_GAS_LIMIT_CHECK,
+            EvmFeatures::PRIORITY_FEE_CHECK,
+            EvmFeatures::EIP3607,
+            EvmFeatures::TX_CHAIN_ID_CHECK,
+        ] {
+            assert!(!sim.feature(feature), "{feature:?} must be off for simulation");
+        }
+
+        // Consensus behavior and every non-validation default are untouched.
+        let base = Version::new(SpecId::OSAKA);
+        for feature in [
+            EvmFeatures::BALANCE_TOP_UP,
+            EvmFeatures::EIP2929,
+            EvmFeatures::EIP3529,
+            EvmFeatures::EIP7623,
+        ] {
+            assert!(sim.feature(feature), "{feature:?} must stay on for simulation");
+        }
+        assert_eq!(sim.gas_params, base.gas_params);
+        assert_eq!(sim.chain_id, base.chain_id);
+        assert_eq!(sim.tx_gas_limit_cap, base.tx_gas_limit_cap);
+        assert_eq!(sim.memory_limit, base.memory_limit);
+        assert_eq!(sim.max_code_size, base.max_code_size);
+        assert_eq!(sim.max_initcode_size, base.max_initcode_size);
+        assert_eq!(sim.max_blobs_per_tx, base.max_blobs_per_tx);
+
+        // The base version is not mutated.
+        assert!(base.feature(EvmFeatures::NONCE_CHECK));
     }
 
     #[test]
