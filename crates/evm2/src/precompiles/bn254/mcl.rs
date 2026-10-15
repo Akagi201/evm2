@@ -3,10 +3,12 @@
 use super::{Bn254Ops, FQ_LEN, FQ2_LEN, G1_LEN, SCALAR_LEN};
 use crate::precompiles::PrecompileHalt;
 use mcl_rust::{CurveType, Fp, Fp2, Fr, G1, G2, GT};
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
 
 unsafe extern "C" {
     fn mclBn_getCurveType() -> i32;
+    fn mclBn_millerLoopVec(z: *mut GT, x: *const G1, y: *const G2, n: usize);
+    fn mclBn_verifyOrderG2(do_verify: i32);
 }
 
 pub(crate) struct MclOps;
@@ -23,6 +25,9 @@ impl Bn254Ops for MclOps {
             // CurveType::SNARK (MCL_BN_SNARK1) is the Ethereum-compatible BN254 (alt_bn128).
             // CurveType::BN254 is a different, older BN254 parameterization.
             assert!(mcl_rust::init(CurveType::SNARK), "mcl BN254 initialization failed");
+            // mcl checks the G2 order with a generic multiplication by r; `read_g2` uses the
+            // faster endomorphism check instead.
+            unsafe { mclBn_verifyOrderG2(0) };
         });
 
         let curve = unsafe { mclBn_getCurveType() };
@@ -80,7 +85,7 @@ impl Bn254Ops for MclOps {
         p.y = y;
         p.z.d[0] = Fp::from_int(1);
 
-        if !p.is_valid() {
+        if !p.is_valid() || !g2_in_subgroup(&p) {
             return Err(PrecompileHalt::Bn254AffineGFailedToCreate);
         }
 
@@ -129,14 +134,9 @@ impl Bn254Ops for MclOps {
 
     #[inline]
     fn pairing_check(g1: &[Self::G1], g2: &[Self::G2]) -> bool {
+        debug_assert_eq!(g1.len(), g2.len());
         let mut acc = GT::zero();
-        mcl_rust::miller_loop(&mut acc, &g1[0], &g2[0]);
-
-        for i in 1..g1.len() {
-            let mut tmp = GT::zero();
-            mcl_rust::miller_loop(&mut tmp, &g1[i], &g2[i]);
-            acc *= &tmp;
-        }
+        unsafe { mclBn_millerLoopVec(&mut acc, g1.as_ptr(), g2.as_ptr(), g1.len()) };
 
         let mut result = GT::zero();
         mcl_rust::final_exp(&mut result, &acc);
@@ -179,4 +179,46 @@ fn read_fp2(input: &[u8]) -> Result<Fp2, PrecompileHalt> {
     fp2.d[0] = real;
     fp2.d[1] = imag;
     Ok(fp2)
+}
+
+/// Checks that an on-curve G2 point is in the r-torsion subgroup by testing `[6x^2]P == psi(P)`,
+/// from section 4.3 of <https://eprint.iacr.org/2022/352.pdf>.
+#[inline]
+fn g2_in_subgroup(p: &G2) -> bool {
+    static CONSTANTS: OnceLock<(Fp2, Fp2, Fr)> = OnceLock::new();
+    let (psi_x, psi_y, six_x_squared) = CONSTANTS.get_or_init(|| {
+        let fp2 = |c0, c1| {
+            let mut r = Fp2::zero();
+            assert!(r.d[0].set_str(c0, 10) && r.d[1].set_str(c1, 10));
+            r
+        };
+        (
+            // (u + 9)^((p - 1) / 3)
+            fp2(
+                "21575463638280843010398324269430826099269044274347216827212613867836435027261",
+                "10307601595873709700152284273816112264069230130616436755625194854815875713954",
+            ),
+            // (u + 9)^((p - 1) / 2)
+            fp2(
+                "2821565182194536844548159561693502659359617185244120367078079554186484126554",
+                "3505843767911556378687030309984248845540243509899259641013678093033130930403",
+            ),
+            Fr::from_str("147946756881789318990833708069417712966", 10).unwrap(),
+        )
+    });
+
+    // psi(x, y) = (conj(x) * psi_x, conj(y) * psi_y) for affine P.
+    let conj = |a: &Fp2| {
+        let mut r = a.clone();
+        Fp::neg(&mut r.d[1], &a.d[1]);
+        r
+    };
+    let mut psi = G2::zero();
+    psi.x = &conj(&p.x) * psi_x;
+    psi.y = &conj(&p.y) * psi_y;
+    psi.z.d[0] = Fp::from_int(1);
+
+    let mut q = G2::zero();
+    G2::mul(&mut q, p, six_x_squared);
+    q == psi
 }
