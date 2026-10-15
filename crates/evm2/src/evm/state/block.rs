@@ -85,7 +85,7 @@ impl BlockStateAccumulator {
     /// Returns storage deltas with storage keys sorted by address and slot.
     pub fn storage_sorted(&self) -> Vec<(StorageKey, &Tracked<Word>)> {
         let mut storage = self.storage().collect::<Vec<_>>();
-        storage.sort_by_key(|(key, _)| (key.address(), key.key()));
+        storage.sort_unstable_by_key(|(key, _)| *key);
         storage
     }
 
@@ -223,7 +223,7 @@ fn visit_block_changes<S: StateChangeSink>(
     }
 
     let mut storage_deltas = storage.iter().collect::<Vec<_>>();
-    storage_deltas.sort_by_key(|entry| (entry.0.address(), entry.0.key()));
+    storage_deltas.sort_unstable_by_key(|entry| *entry.0);
     for (key, delta) in storage_deltas {
         sink.storage(StorageChange {
             address: key.address(),
