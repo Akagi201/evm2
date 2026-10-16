@@ -133,6 +133,97 @@ pub trait DynDatabase: NonStaticAny {
     fn get_block_hash(&mut self, number: &Word) -> DbResult<B256>;
 }
 
+/// Borrowed view of a backing database.
+///
+/// The read-only counterpart of [`Database`]: every read takes `&self`, so one database can back
+/// many executions at once without cloning. Caching belongs in the wrapper each execution owns,
+/// such as [`CacheDB`], never in the shared view.
+#[auto_impl(&, Box, Rc, Arc)]
+pub trait DatabaseRef {
+    /// Loads account information.
+    fn get_account(&self, address: &Address) -> DbResult<Option<AccountInfo>>;
+
+    /// Loads bytecode by code hash.
+    fn get_code_by_hash(&self, code_hash: &B256) -> DbResult<Bytecode>;
+
+    /// Loads a persistent storage slot.
+    fn get_storage(&self, address: &Address, key: &Word) -> DbResult<Word>;
+
+    /// Loads a historical block hash.
+    ///
+    /// Callers only request numbers inside the `BLOCKHASH` window, so a hash the database cannot
+    /// provide is a database failure reported through the error, never a benign miss.
+    fn get_block_hash(&self, number: &Word) -> DbResult<B256>;
+}
+
+/// Object-safe database adapter for borrowed database views.
+#[derive(Clone, Debug)]
+pub struct DbRef<T>(T);
+
+impl<T: DatabaseRef> DbRef<T> {
+    /// Creates a new database adapter.
+    #[inline]
+    pub const fn new(db: T) -> Self {
+        Self(db)
+    }
+
+    /// Returns the wrapped database view.
+    #[inline]
+    pub const fn inner(&self) -> &T {
+        &self.0
+    }
+
+    /// Consumes the adapter and returns the wrapped database view.
+    #[inline]
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+impl<T: DatabaseRef> DynDatabase for DbRef<T> {
+    #[inline]
+    fn get_account(&mut self, address: &Address) -> DbResult<Option<AccountInfo>> {
+        self.0.get_account(address)
+    }
+
+    #[inline]
+    fn get_code_by_hash(&mut self, code_hash: &B256) -> DbResult<Bytecode> {
+        self.0.get_code_by_hash(code_hash)
+    }
+
+    #[inline]
+    fn get_storage(&mut self, address: &Address, key: &Word) -> DbResult<Word> {
+        self.0.get_storage(address, key)
+    }
+
+    #[inline]
+    fn get_block_hash(&mut self, number: &Word) -> DbResult<B256> {
+        self.0.get_block_hash(number)
+    }
+}
+
+impl<T: Database + DatabaseRef> DatabaseRef for Db<T> {
+    #[inline]
+    fn get_account(&self, address: &Address) -> DbResult<Option<AccountInfo>> {
+        self.inner().get_account(address)
+    }
+
+    #[inline]
+    fn get_code_by_hash(&self, code_hash: &B256) -> DbResult<Bytecode> {
+        self.inner().get_code_by_hash(code_hash)
+    }
+
+    #[inline]
+    fn get_storage(&self, address: &Address, key: &Word) -> DbResult<Word> {
+        self.inner().get_storage(address, key)
+    }
+
+    #[inline]
+    fn get_block_hash(&self, number: &Word) -> DbResult<B256> {
+        self.inner().get_block_hash(number)
+    }
+}
+
 /// Counts calls made through a [`DynDatabase`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DbStatsCounts {
@@ -331,6 +422,12 @@ impl DynDatabase for EmptyDB {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interpreter::op;
+    use alloc::{sync::Arc, vec, vec::Vec};
+    use alloy_primitives::Bytes;
+
+    #[cfg(feature = "std")]
+    use std::thread;
 
     struct BorrowingDb<'a> {
         value: &'a u8,
@@ -367,5 +464,100 @@ mod tests {
         let erased: Box<dyn DynDatabase + 'static> = boxed_dyn_database(EmptyDB::default());
 
         assert!(erased.downcast_ref::<EmptyDB>().is_some());
+    }
+
+    const REF_ACCOUNT: Address = Address::with_last_byte(0xaa);
+    const REF_SLOT: Word = Word::from_limbs([7, 0, 0, 0]);
+
+    /// Read-only fixture: one account with code, one slot, one block hash.
+    struct RefDb {
+        balance: Word,
+        code: Bytecode,
+        block_hash: B256,
+    }
+
+    impl Default for RefDb {
+        fn default() -> Self {
+            Self {
+                balance: Word::from(5),
+                code: Bytecode::new_legacy(Bytes::from_static(&[op::STOP])),
+                block_hash: keccak256([0x02]),
+            }
+        }
+    }
+
+    impl DatabaseRef for RefDb {
+        fn get_account(&self, address: &Address) -> DbResult<Option<AccountInfo>> {
+            Ok((*address == REF_ACCOUNT).then(|| {
+                AccountInfo::default().with_balance(self.balance).with_code(self.code.clone())
+            }))
+        }
+
+        fn get_code_by_hash(&self, code_hash: &B256) -> DbResult<Bytecode> {
+            Ok(if *code_hash == self.code.hash_slow() {
+                self.code.clone()
+            } else {
+                Bytecode::default()
+            })
+        }
+
+        fn get_storage(&self, address: &Address, key: &Word) -> DbResult<Word> {
+            Ok(if *address == REF_ACCOUNT && *key == REF_SLOT { self.balance } else { Word::ZERO })
+        }
+
+        fn get_block_hash(&self, number: &Word) -> DbResult<B256> {
+            Ok(if *number == Word::from(9) { self.block_hash } else { B256::ZERO })
+        }
+    }
+
+    #[test]
+    fn db_ref_reads_through_a_borrowed_view() {
+        let db = RefDb::default();
+        let mut cache = CacheDB::new(DbRef::new(&db));
+
+        let account =
+            DynDatabase::get_account(&mut cache, &REF_ACCOUNT).unwrap().expect("account exists");
+        assert_eq!(account.balance, Word::from(5));
+        assert_eq!(account.code_hash, db.code.hash_slow());
+        assert_eq!(
+            DynDatabase::get_storage(&mut cache, &REF_ACCOUNT, &REF_SLOT).unwrap(),
+            Word::from(5)
+        );
+        assert_eq!(
+            DynDatabase::get_code_by_hash(&mut cache, &db.code.hash_slow()).unwrap().len(),
+            1
+        );
+        assert_eq!(DynDatabase::get_block_hash(&mut cache, &Word::from(9)).unwrap(), db.block_hash);
+
+        // The borrow is released with the adapter, so the same database serves later reads.
+        assert_eq!(db.balance, Word::from(5));
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn db_ref_shares_one_database_across_workers() {
+        let db = Arc::new(RefDb::default());
+        let balances = thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    let db = Arc::clone(&db);
+                    scope.spawn(move || {
+                        let mut cache = CacheDB::new(DbRef::new(db));
+                        DynDatabase::get_account(&mut cache, &REF_ACCOUNT)
+                            .unwrap()
+                            .expect("account exists")
+                            .balance
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("worker panicked"))
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(balances, vec![Word::from(5); 4]);
+        // Every worker dropped its handle when it finished.
+        assert_eq!(Arc::strong_count(&db), 1);
     }
 }
