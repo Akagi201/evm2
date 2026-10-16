@@ -167,7 +167,7 @@ mod db;
 use db::boxed_dyn_database;
 pub use db::{
     AccountStorageCache, Cache, CacheDB, Database, DatabaseRef, Db, DbRef, DbResult, DbStats,
-    DbStatsCounts, DynDatabase, EmptyDB, InMemoryDB,
+    DbStatsCounts, DynDatabase, DynDatabaseRef, EmptyDB, InMemoryDB,
 };
 
 mod tx;
