@@ -56,6 +56,46 @@ pub enum TxEnvelope {
 /// Recovered Ethereum transaction envelope.
 pub type RecoveredTxEnvelope = Recovered<TxEnvelope>;
 
+/// An unsigned transaction for `eth_call`-style simulation.
+///
+/// `eth_call`-style entry points accept loose fields and a caller supplied out of band; the
+/// transaction they execute has no signature. This carries those fields and converts into the
+/// recovered envelope [`Evm::transact`](crate::evm::Evm::transact) consumes, without going
+/// through the signed-transaction types.
+///
+/// The fields map onto the legacy envelope, which is what a node executes when a request does
+/// not commit to a transaction type. The other envelope variants keep being constructed by
+/// hand.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SimulateTx {
+    /// Sender, supplied out of band because the transaction is not signed.
+    pub caller: Address,
+    /// Chain ID, if chain-id validation is on.
+    pub chain_id: Option<u64>,
+    /// Transaction nonce.
+    pub nonce: u64,
+    /// Effective gas price.
+    pub gas_price: u128,
+    /// Gas limit.
+    pub gas_limit: u64,
+    /// Recipient, or create.
+    pub to: TxKind,
+    /// Transferred value.
+    pub value: U256,
+    /// Calldata.
+    pub input: Bytes,
+}
+
+impl SimulateTx {
+    /// Converts into the recovered envelope the EVM consumes.
+    #[inline]
+    pub fn into_recovered(self) -> RecoveredTxEnvelope {
+        let Self { caller, chain_id, nonce, gas_price, gas_limit, to, value, input } = self;
+        let tx = TxLegacy { chain_id, nonce, gas_price, gas_limit, to, value, input };
+        Recovered::new_unchecked(TxEnvelope::Legacy(tx), caller)
+    }
+}
+
 /// Transaction state produced by validation and pre-execution processing for the standard
 /// Ethereum handlers.
 #[derive(Clone, Copy, Debug)]
@@ -1391,5 +1431,63 @@ mod tests {
                 cap: amsterdam_without_eip8037.tx_gas_limit_cap,
             })
         );
+    }
+
+    #[test]
+    fn simulate_tx_converts_into_a_recovered_legacy_envelope() {
+        let caller = Address::with_last_byte(0xaa);
+        let to = TxKind::Call(Address::with_last_byte(0xbb));
+        let input = Bytes::from_static(&[0x01]);
+        let tx = SimulateTx {
+            caller,
+            chain_id: Some(1),
+            nonce: 7,
+            gas_price: 42,
+            gas_limit: 21_000,
+            to,
+            value: U256::from(5),
+            input: input.clone(),
+        };
+
+        let recovered = tx.into_recovered();
+        assert_eq!(recovered.signer(), caller);
+        let TxEnvelope::Legacy(inner) = recovered.inner() else {
+            panic!("expected the legacy envelope");
+        };
+        assert_eq!(inner.chain_id, Some(1));
+        assert_eq!(inner.nonce, 7);
+        assert_eq!(inner.gas_price, 42);
+        assert_eq!(inner.gas_limit, 21_000);
+        assert_eq!(inner.to, to);
+        assert_eq!(inner.value, U256::from(5));
+        assert_eq!(inner.input, input);
+    }
+
+    #[test]
+    fn simulate_tx_executes_through_the_standard_handler() {
+        let version = Version::base(SpecId::PRAGUE);
+        let tx = SimulateTx {
+            caller: Address::with_last_byte(0xaa),
+            chain_id: Some(version.chain_id),
+            gas_limit: 21_000,
+            to: TxKind::Call(Address::with_last_byte(0xbb)),
+            ..SimulateTx::default()
+        }
+        .into_recovered();
+
+        let registry = ethereum_tx_registry::<BaseEvmTypes>(SpecId::PRAGUE);
+        let mut evm = Evm::<BaseEvmTypes>::new(
+            SpecId::PRAGUE,
+            BlockEnvExt::default(),
+            registry,
+            InMemoryDB::default(),
+            Precompiles::base(SpecId::PRAGUE),
+        );
+
+        assert!(evm.validate_tx(&tx).is_ok());
+        let result = evm.transact(&tx).map(crate::evm::ExecutedTx::discard).unwrap();
+        assert!(result.status);
+        assert_eq!(result.total_gas_spent, 21_000);
+        assert_eq!(result.tx_gas_used(), 21_000);
     }
 }
