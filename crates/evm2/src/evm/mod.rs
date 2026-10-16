@@ -186,6 +186,9 @@ pub use state::{
 mod prewarm_set;
 pub use prewarm_set::PrewarmSet;
 
+mod miss;
+pub use miss::{MissRecorder, ReadSet};
+
 /// Optional external interpreter runner.
 ///
 /// Returning `Some(stop)` means the runner executed the frame. Returning `None` makes the EVM run
